@@ -3,7 +3,6 @@ import 'dart:async';
 import 'dart:io';
 import 'dart:convert';
 import 'dart:math';
-import 'package:logger/logger.dart';
 import 'package:web_socket_channel/web_socket_channel.dart';
 
 enum ConnectionStatus { idle, connecting, connected, error, reconnecting }
@@ -17,12 +16,14 @@ LinkQuality qualityFor(int latencyMs) {
   return LinkQuality.disconnected;
 }
 
+void _log(String message) {
+  print('[ConnectionService] $message');
+}
+
 class ConnectionService extends ChangeNotifier {
   static const int CONTROL_PORT = 8765;
   static const int VIDEO_PORT = 8766;
   static const int DISCOVERY_PORT = 8767;
-
-  final logger = Logger();
 
   String _host = '';
   int _controlPort = CONTROL_PORT;
@@ -60,24 +61,24 @@ class ConnectionService extends ChangeNotifier {
 
       setStatus(ConnectionStatus.connecting);
 
-      logger.i('[ConnectionService] Connecting to $host');
-      logger.i('[ConnectionService] Control port: $controlPort');
-      logger.i('[ConnectionService] Video port: $videoPort');
+      _log('Connecting to $host');
+      _log('Control port: $controlPort');
+      _log('Video port: $videoPort');
 
       // Connect WebSocket control channel first
       final wsUrl = 'ws://$host:$controlPort';
-      logger.i('[ConnectionService] Connecting control WebSocket: $wsUrl');
+      _log('Connecting control WebSocket: $wsUrl');
 
       try {
         final receivedDeviceId = await _connectWebSocket(wsUrl);
-        logger.i('[ConnectionService] Control WebSocket handshake complete ✓, deviceId=$receivedDeviceId');
+        _log('Control WebSocket handshake complete ✓, deviceId=$receivedDeviceId');
 
         // Check if video port is accessible
-        logger.i('[ConnectionService] Checking video port $videoPort...');
+        _log('Checking video port $videoPort...');
         final videoPortAccessible = await _checkPortAccessible(host, videoPort, 2000);
         if (!videoPortAccessible) {
-          logger.w('[ConnectionService] WARNING: Video port $videoPort may not be accessible');
-          logger.w('[ConnectionService] Make sure desktop app is running and listening on video port');
+          _log('WARNING: Video port $videoPort may not be accessible');
+          _log('Make sure desktop app is running and listening on video port');
         }
 
         // Connect video stream
@@ -85,16 +86,16 @@ class ConnectionService extends ChangeNotifier {
 
         setStatus(ConnectionStatus.connected);
         _reconnectAttempts = 0;
-        logger.i('[ConnectionService] Connection complete ✓');
+        _log('Connection complete ✓');
 
         return true;
       } catch (e) {
-        logger.e('[ConnectionService] Connection failed: $e');
+        _log('Connection failed: $e');
         setStatus(ConnectionStatus.error);
         return false;
       }
     } catch (e) {
-      logger.e('[ConnectionService] Unexpected error during connect: $e');
+      _log('Unexpected error during connect: $e');
       setStatus(ConnectionStatus.error);
       return false;
     }
@@ -110,14 +111,14 @@ class ConnectionService extends ChangeNotifier {
         socket.destroy();
 
         final elapsed = DateTime.now().millisecondsSinceEpoch - startTime;
-        logger.i('[ConnectionService] Port check $host:$port: OPEN (${elapsed}ms)');
+        _log('Port check $host:$port: OPEN (${elapsed}ms)');
         return true;
       } on SocketException {
-        logger.i('[ConnectionService] Port check $host:$port: CLOSED');
+        _log('Port check $host:$port: CLOSED');
         return false;
       }
     } catch (e) {
-      logger.e('[ConnectionService] Port check error for $host:$port: $e');
+      _log('Port check error for $host:$port: $e');
       return false;
     }
   }
@@ -141,11 +142,10 @@ class ConnectionService extends ChangeNotifier {
       _ws!.stream.listen((data) {
         try {
           final msg = jsonDecode(data);
-          logger.d('[ConnectionService] WebSocket message: ${msg['type']}');
 
           if (msg['type'] == 'welcome') {
             _deviceId = msg['deviceId'] ?? '';
-            logger.i('[ConnectionService] Welcome received, deviceId=$_deviceId');
+            _log('Welcome received, deviceId=$_deviceId');
             if (!resolved) {
               resolved = true;
               timeout.cancel();
@@ -158,14 +158,14 @@ class ConnectionService extends ChangeNotifier {
               notifyListeners();
             }
           } else if (msg['type'] == 'command') {
-            logger.i('[ConnectionService] Command: ${msg['action']}');
+            _log('Command: ${msg['action']}');
           }
         } catch (e) {
-          logger.w('[ConnectionService] Error parsing message: $e');
+          _log('Error parsing message: $e');
         }
       },
       onError: (error) {
-        logger.e('[ConnectionService] WebSocket error: $error');
+        _log('WebSocket error: $error');
         if (!resolved) {
           resolved = true;
           timeout.cancel();
@@ -175,7 +175,7 @@ class ConnectionService extends ChangeNotifier {
         _reconnect();
       },
       onDone: () {
-        logger.i('[ConnectionService] WebSocket closed');
+        _log('WebSocket closed');
         if (!resolved) {
           resolved = true;
           timeout.cancel();
@@ -190,7 +190,7 @@ class ConnectionService extends ChangeNotifier {
 
       return completer.future;
     } catch (e) {
-      logger.e('[ConnectionService] WebSocket connection error: $e');
+      _log('WebSocket connection error: $e');
       if (!resolved) {
         resolved = true;
         timeout.cancel();
@@ -207,7 +207,7 @@ class ConnectionService extends ChangeNotifier {
     String deviceId,
   ) async {
     try {
-      logger.i('[ConnectionService] Connecting video stream: $host:$port, deviceId=$deviceId');
+      _log('Connecting video stream: $host:$port, deviceId=$deviceId');
 
       _videoSocket = await Socket.connect(host, port,
         timeout: const Duration(seconds: 5),
@@ -221,26 +221,25 @@ class ConnectionService extends ChangeNotifier {
       }
       _videoSocket!.add(headerBytes);
 
-      logger.i('[ConnectionService] Video stream connected ✓');
+      _log('Video stream connected ✓');
 
       _videoSocket!.listen(
         (data) {
           // Video frames arrive here
           _framesSent++;
-          logger.d('[ConnectionService] Frame received, total: $_framesSent');
         },
         onError: (error) {
-          logger.e('[ConnectionService] Video socket error: $error');
+          _log('Video socket error: $error');
           _reconnectVideoStream();
         },
         onDone: () {
-          logger.w('[ConnectionService] Video socket closed');
+          _log('Video socket closed');
           _reconnectVideoStream();
         },
       );
     } catch (e) {
-      logger.e('[ConnectionService] Video connection failed: $e');
-      logger.e('[ConnectionService] Ensure: 1) Desktop app running 2) Port $port open 3) Same network');
+      _log('Video connection failed: $e');
+      _log('Ensure: 1) Desktop app running 2) Port $port open 3) Same network');
       throw e;
     }
   }
@@ -257,7 +256,7 @@ class ConnectionService extends ChangeNotifier {
             't': DateTime.now().millisecondsSinceEpoch,
           }));
         } catch (e) {
-          logger.w('[ConnectionService] Error sending ping: $e');
+          _log('Error sending ping: $e');
           timer.cancel();
         }
       } else {
@@ -269,7 +268,7 @@ class ConnectionService extends ChangeNotifier {
   void _reconnect() {
     if (_reconnectTimer?.isActive ?? false) return;
     if (_reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
-      logger.w('[ConnectionService] Max reconnection attempts reached');
+      _log('Max reconnection attempts reached');
       setStatus(ConnectionStatus.error);
       return;
     }
@@ -278,7 +277,7 @@ class ConnectionService extends ChangeNotifier {
     final delay = (1000 * pow(2, _reconnectAttempts - 1)).toInt();
     final clampedDelay = delay.clamp(0, 16000);
 
-    logger.i('[ConnectionService] Reconnecting (attempt $_reconnectAttempts/$MAX_RECONNECT_ATTEMPTS) in ${clampedDelay}ms...');
+    _log('Reconnecting (attempt $_reconnectAttempts/$MAX_RECONNECT_ATTEMPTS) in ${clampedDelay}ms...');
 
     setStatus(ConnectionStatus.reconnecting);
 
@@ -294,9 +293,9 @@ class ConnectionService extends ChangeNotifier {
 
   void _reconnectVideoStream() {
     if (_host.isNotEmpty && _deviceId.isNotEmpty) {
-      logger.i('[ConnectionService] Reconnecting video stream...');
+      _log('Reconnecting video stream...');
       _connectVideoStream(_host, _videoPort, _deviceId).catchError((e) {
-        logger.e('[ConnectionService] Video reconnect failed: $e');
+        _log('Video reconnect failed: $e');
         Future.delayed(Duration(seconds: 2), _reconnectVideoStream);
       });
     }
@@ -309,10 +308,10 @@ class ConnectionService extends ChangeNotifier {
           'type': 'capabilities',
           'value': caps,
         }));
-        logger.i('[ConnectionService] Capabilities sent');
+        _log('Capabilities sent');
       }
     } catch (e) {
-      logger.e('[ConnectionService] Error sending capabilities: $e');
+      _log('Error sending capabilities: $e');
     }
   }
 
@@ -323,10 +322,10 @@ class ConnectionService extends ChangeNotifier {
           'type': 'orientation',
           'angle': angle,
         }));
-        logger.i('[ConnectionService] Orientation sent: $angle');
+        _log('Orientation sent: $angle');
       }
     } catch (e) {
-      logger.e('[ConnectionService] Error sending orientation: $e');
+      _log('Error sending orientation: $e');
     }
   }
 
@@ -337,7 +336,7 @@ class ConnectionService extends ChangeNotifier {
 
   void disconnect() {
     try {
-      logger.i('[ConnectionService] Disconnecting...');
+      _log('Disconnecting...');
 
       _reconnectTimer?.cancel();
       _reconnectTimer = null;
@@ -354,9 +353,9 @@ class ConnectionService extends ChangeNotifier {
       _deviceId = '';
       _reconnectAttempts = 0;
 
-      logger.i('[ConnectionService] Disconnect complete ✓');
+      _log('Disconnect complete ✓');
     } catch (e) {
-      logger.e('[ConnectionService] Error disconnecting: $e');
+      _log('Error disconnecting: $e');
     }
     setStatus(ConnectionStatus.idle);
   }
