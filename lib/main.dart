@@ -53,8 +53,9 @@ class SafeApp extends StatefulWidget {
 }
 
 class _SafeAppState extends State<SafeApp> {
-  late ConnectionService _connectionService;
+  ConnectionService? _connectionService;
   String? _initError;
+  bool _isInitializing = true;
 
   @override
   void initState() {
@@ -63,25 +64,54 @@ class _SafeAppState extends State<SafeApp> {
   }
 
   void _initializeServices() {
-    try {
-      _connectionService = ConnectionService();
-      if (mounted) {
-        setState(() {
-          _initError = null;
-        });
-      }
-    } catch (e) {
-      print('Service init error: $e');
-      if (mounted) {
-        setState(() {
-          _initError = '$e';
-        });
-      }
+    if (mounted) {
+      setState(() {
+        _isInitializing = true;
+        _initError = null;
+      });
     }
+
+    Future.delayed(Duration(milliseconds: 500), () {
+      try {
+        final service = ConnectionService();
+        if (mounted) {
+          setState(() {
+            _connectionService = service;
+            _isInitializing = false;
+            _initError = null;
+          });
+        }
+      } catch (e) {
+        print('Service init error: $e');
+        print('Stack trace: ${StackTrace.current}');
+        if (mounted) {
+          setState(() {
+            _connectionService = null;
+            _isInitializing = false;
+            _initError = 'Failed to initialize: $e';
+          });
+        }
+      }
+    });
   }
 
   @override
   Widget build(BuildContext context) {
+    if (_isInitializing) {
+      return Scaffold(
+        body: Center(
+          child: Column(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+              const CircularProgressIndicator(),
+              const SizedBox(height: 16),
+              const Text('Initializing Church Cam...'),
+            ],
+          ),
+        ),
+      );
+    }
+
     if (_initError != null) {
       return Scaffold(
         body: Center(
@@ -90,7 +120,34 @@ class _SafeAppState extends State<SafeApp> {
             children: [
               const Icon(Icons.error, color: Colors.red, size: 48),
               const SizedBox(height: 16),
-              Text('Initialization Error:\n$_initError'),
+              Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 16),
+                child: Text(
+                  'Initialization Error:\n$_initError',
+                  textAlign: TextAlign.center,
+                  style: const TextStyle(fontSize: 14),
+                ),
+              ),
+              const SizedBox(height: 32),
+              ElevatedButton(
+                onPressed: _initializeServices,
+                child: const Text('Retry'),
+              ),
+            ],
+          ),
+        ),
+      );
+    }
+
+    if (_connectionService == null) {
+      return Scaffold(
+        body: Center(
+          child: Column(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+              const Icon(Icons.warning, color: Colors.orange, size: 48),
+              const SizedBox(height: 16),
+              const Text('Connection Service Not Available'),
               const SizedBox(height: 32),
               ElevatedButton(
                 onPressed: _initializeServices,
@@ -103,7 +160,7 @@ class _SafeAppState extends State<SafeApp> {
     }
 
     return ChangeNotifierProvider<ConnectionService>.value(
-      value: _connectionService,
+      value: _connectionService!,
       child: const ConnectScreen(),
     );
   }
