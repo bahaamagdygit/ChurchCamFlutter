@@ -7,14 +7,19 @@ echo Church Cam Flutter - Build APK
 echo ========================================
 echo.
 
-REM Set Flutter path
-set FLUTTER_PATH=C:\Users\PC\Downloads\flutter_windows_3.41.9-stable\flutter
+REM Set Flutter path — change this to wherever you unzipped the Flutter SDK.
+REM If "flutter" is already on your PATH you can leave this blank.
+set FLUTTER_PATH=C:\flutter
 
-REM Check if Flutter exists
-if not exist "!FLUTTER_PATH!" (
-    echo ERROR: Flutter not found at !FLUTTER_PATH!
-    pause
-    exit /b 1
+REM If a folder path is set, verify it exists; otherwise rely on PATH.
+if not "%FLUTTER_PATH%"=="" (
+    if not exist "!FLUTTER_PATH!" (
+        echo ERROR: Flutter not found at !FLUTTER_PATH!
+        echo Edit FLUTTER_PATH in this script to point at your Flutter SDK,
+        echo or install Flutter and add it to your PATH.
+        pause
+        exit /b 1
+    )
 )
 
 REM Set PATH to include Flutter
