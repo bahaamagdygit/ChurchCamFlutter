@@ -36,24 +36,26 @@ class _ControlScreenState extends State<ControlScreen> {
       body: ListView(
         padding: const EdgeInsets.all(16),
         children: [
-          // ── Camera ──
-          _section('Camera', [
-            if (cams.isNotEmpty)
-              _labeled('Desktop camera', DropdownButton<String>(
-                value: _selectedDesktopCam ?? cams.first.id,
-                isExpanded: true,
-                dropdownColor: _card,
-                style: const TextStyle(color: Colors.white),
-                items: cams.map((c) => DropdownMenuItem(value: c.id, child: Text(c.label))).toList(),
-                onChanged: (v) {
-                  if (v == null) return;
-                  setState(() => _selectedDesktopCam = v);
-                  conn.selectDesktopCamera(v);
-                },
-              ))
+          // ── Live cameras: tap one to put it live on the desktop ──
+          _section('Live Cameras', [
+            if (cams.isEmpty)
+              const Padding(
+                padding: EdgeInsets.symmetric(vertical: 8),
+                child: Text('No cameras reported by the desktop yet.',
+                    style: TextStyle(color: Color(0xFF666666))),
+              )
             else
-              const Text('No desktop cameras reported', style: TextStyle(color: Color(0xFF666666))),
-            const SizedBox(height: 8),
+              ...cams.map((c) {
+                // The desktop reports the ACTIVE camera by label; match against it,
+                // and also treat a locally-tapped selection as active immediately.
+                final isLive = _selectedDesktopCam == c.id ||
+                    (_selectedDesktopCam == null && c.label == conn.activeCameraLabel);
+                return _cameraRow(c, isLive, () {
+                  setState(() => _selectedDesktopCam = c.id);
+                  conn.selectDesktopCamera(c.id);
+                });
+              }),
+            const SizedBox(height: 12),
             _labeled('Desktop zoom  ${_desktopZoom.toStringAsFixed(1)}×', Slider(
               value: _desktopZoom, min: 1, max: 4, divisions: 30, activeColor: _purple,
               onChanged: (v) => setState(() => _desktopZoom = v),
@@ -135,6 +137,43 @@ class _ControlScreenState extends State<ControlScreen> {
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [Text(label, style: const TextStyle(color: Color(0xFFAAAAAA), fontSize: 13)), child],
       );
+
+  /// A selectable camera row — tap to put it live on the desktop.
+  Widget _cameraRow(DesktopCamera c, bool isLive, VoidCallback onTap) {
+    final icon = c.kind == 'ip' ? Icons.router
+        : c.kind == 'mobile' ? Icons.smartphone
+        : Icons.videocam;
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 8),
+      child: InkWell(
+        borderRadius: BorderRadius.circular(12),
+        onTap: onTap,
+        child: Container(
+          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 12),
+          decoration: BoxDecoration(
+            color: isLive ? const Color(0x33818CF8) : const Color(0xFF07070F),
+            borderRadius: BorderRadius.circular(12),
+            border: Border.all(color: isLive ? _purple : _border, width: isLive ? 1.5 : 1),
+          ),
+          child: Row(children: [
+            Icon(icon, color: isLive ? _purple : Colors.white70, size: 20),
+            const SizedBox(width: 12),
+            Expanded(child: Text(c.label,
+                maxLines: 1, overflow: TextOverflow.ellipsis,
+                style: TextStyle(color: Colors.white, fontWeight: isLive ? FontWeight.w700 : FontWeight.w500))),
+            if (isLive)
+              Container(
+                padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+                decoration: BoxDecoration(color: const Color(0xFFEF4444), borderRadius: BorderRadius.circular(6)),
+                child: const Text('LIVE', style: TextStyle(color: Colors.white, fontSize: 10, fontWeight: FontWeight.w800)),
+              )
+            else
+              const Text('Tap to go live', style: TextStyle(color: _purple, fontSize: 11, fontWeight: FontWeight.w600)),
+          ]),
+        ),
+      ),
+    );
+  }
 
   Widget _chip(IconData icon, String label, VoidCallback onTap) => ActionChip(
         backgroundColor: const Color(0xFF07070F),

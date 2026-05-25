@@ -23,11 +23,13 @@ class RemoteCommand {
   const RemoteCommand(this.action, this.value);
 }
 
-/// A camera available on the desktop (from the welcome message).
+/// A camera available on the desktop (from welcome / desktop_state).
+/// `id` carries the desktop's switch prefix (e.g. `usb:<deviceId>` or `ip:<id>`).
 class DesktopCamera {
   final String id;
   final String label;
-  const DesktopCamera({required this.id, required this.label});
+  final String kind; // 'usb' | 'ip' | 'mobile' | ''
+  const DesktopCamera({required this.id, required this.label, this.kind = ''});
 }
 
 void _log(String message) {
@@ -83,6 +85,7 @@ class ConnectionService extends ChangeNotifier {
 
   // Desktop state (from welcome / desktop_state).
   List<DesktopCamera> _desktopCameras = const [];
+  String _activeCameraLabel = '';
   bool _streamLive = false;
   bool _recording = false;
 
@@ -100,6 +103,7 @@ class ConnectionService extends ChangeNotifier {
   List<String> get readingLangs => _readingLangs;
   bool get isVideoReady => _videoSocket != null && _videoHeaderSent;
   List<DesktopCamera> get desktopCameras => _desktopCameras;
+  String get activeCameraLabel => _activeCameraLabel;
   bool get streamLive => _streamLive;
   bool get recording => _recording;
 
@@ -333,6 +337,19 @@ class ConnectionService extends ChangeNotifier {
         if (v is Map) {
           if (v['streamStatus'] != null) _streamLive = v['streamStatus'] == 'live';
           if (v['recordingStatus'] != null) _recording = v['recordingStatus'] == 'recording';
+          if (v['activeCameraLabel'] != null) _activeCameraLabel = v['activeCameraLabel'].toString();
+          // Live list of every camera the desktop can switch to (usb:/ip: ids).
+          if (v['availableCameras'] is List) {
+            _desktopCameras = (v['availableCameras'] as List)
+                .whereType<Map>()
+                .map((m) => DesktopCamera(
+                      id: (m['id'] ?? '').toString(),
+                      label: (m['label'] ?? '').toString(),
+                      kind: (m['kind'] ?? '').toString(),
+                    ))
+                .where((c) => c.id.isNotEmpty)
+                .toList();
+          }
           notifyListeners();
         }
         _emitCommand(RemoteCommand('desktop_state', v));
