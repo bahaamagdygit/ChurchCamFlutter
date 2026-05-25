@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 import 'services/connection_service.dart';
 import 'screens/connect_screen.dart';
+import 'screens/camera_screen.dart';
 
 void main() {
   runApp(const MyApp());
