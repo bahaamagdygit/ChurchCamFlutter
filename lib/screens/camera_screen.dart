@@ -1,11 +1,19 @@
+import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:camera/camera.dart';
 import 'package:provider/provider.dart';
 import 'package:wakelock_plus/wakelock_plus.dart';
 import '../services/connection_service.dart';
 import '../services/camera_service.dart';
+import '../services/orientation_service.dart';
+import '../services/storage.dart';
+import '../models/camera_filters.dart';
 import '../utils/permissions.dart';
 import '../widgets/reading_overlay.dart';
+import '../widgets/connection_badge.dart';
+import '../widgets/filtered_preview.dart';
+
+const _purple = Color(0xFF818CF8);
 
 class CameraScreen extends StatefulWidget {
   const CameraScreen({super.key});
@@ -16,15 +24,24 @@ class CameraScreen extends StatefulWidget {
 
 class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver {
   final CameraService _camera = CameraService();
+  final OrientationService _orientation = OrientationService();
 
   bool _permissionDenied = false;
   bool _initializing = true;
   String? _initError;
 
-  // Pinch-to-zoom state
+  CameraFilters _filters = CameraFilters.none;
+  bool _showFilters = false;
+
+  // Pinch-to-zoom
   double _baseZoom = 1.0;
   bool _showZoomBar = false;
 
+  // Focus ring
+  Offset? _focusPoint;
+  Timer? _focusTimer;
+
+  Timer? _adaptiveTimer;
   ConnectionService? _conn;
 
   @override
@@ -34,6 +51,9 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
     WakelockPlus.enable();
     _conn = context.read<ConnectionService>();
     _conn!.addCommandListener(_onRemoteCommand);
+    _conn!.stateProvider = _buildStateRestore;
+    _orientation.addListener(_onOrientation);
+    _orientation.start();
     _bootstrap();
   }
 
@@ -41,90 +61,169 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
     final granted = await requestCameraPermission();
     if (!mounted) return;
     if (!granted) {
-      setState(() {
-        _permissionDenied = true;
-        _initializing = false;
-      });
+      setState(() { _permissionDenied = true; _initializing = false; });
       return;
     }
-
     final ok = await _camera.initialize();
     if (!mounted) return;
     if (!ok) {
-      setState(() {
-        _initError = 'No camera available on this device.';
-        _initializing = false;
-      });
+      setState(() { _initError = 'No camera available on this device.'; _initializing = false; });
       return;
     }
 
-    // Advertise zoom/torch capabilities so the desktop slider has the right range.
+    // Restore last filters for this camera.
+    _filters = await loadFilters(_camera.lensDirection.name);
+
     _conn?.sendCapabilities(_camera.capabilities());
-
-    // Pipe encoded JPEG frames straight to the video socket.
     _camera.onJpegFrame = (jpeg) => _conn?.sendFrame(jpeg);
+    _camera.canSendFrame = () => _conn?.canAcceptFrame ?? false;
+    _camera.onEncoderRestart = (reason) => _conn?.reportUnsupported('encoder', 'restarted: $reason');
     await _camera.startStreaming();
-
     _camera.addListener(_onCameraChanged);
+
+    // Adaptive-quality tick (Section 6): feed socket backlog every 500ms.
+    _adaptiveTimer = Timer.periodic(const Duration(milliseconds: 500), (_) {
+      _camera.reportBacklog(_conn?.pendingVideoBytes ?? 0);
+    });
+
     if (mounted) setState(() => _initializing = false);
   }
 
-  void _onCameraChanged() {
+  Map<String, dynamic> _buildStateRestore() => {
+        'capabilities': _camera.capabilities(),
+        'orientationAngle': _orientation.angle,
+        'zoom': _camera.zoom,
+        'filters': _filters.toJson(),
+      };
+
+  void _onCameraChanged() { if (mounted) setState(() {}); }
+
+  void _onOrientation() {
+    _conn?.sendOrientationAngle(_orientation.angle);
     if (mounted) setState(() {});
   }
 
-  /// Commands pushed from the desktop operator.
-  void _onRemoteCommand(RemoteCommand cmd) {
+  // ── Desktop → mobile controls (Section 4) ────────────────────────────────────
+  Future<void> _onRemoteCommand(RemoteCommand cmd) async {
+    final conn = _conn;
     switch (cmd.action) {
       case 'set_zoom':
       case 'zoom':
-        final v = cmd.value;
-        if (v is num) _applyZoom(v.toDouble());
+        if (cmd.value is num) {
+          await _camera.setZoom((cmd.value as num).toDouble());
+          conn?.confirmControl('zoom', _camera.zoom);
+          _showZoomIndicator();
+        }
         break;
-      case 'flip':
-      case 'switch_camera':
-        _camera.switchCamera();
+      case 'focus':
+        if (cmd.value is Map) {
+          final x = (cmd.value['x'] as num?)?.toDouble() ?? 0.5;
+          final y = (cmd.value['y'] as num?)?.toDouble() ?? 0.5;
+          final ok = await _camera.focusAt(x, y);
+          _ringAt(Offset(x, y));
+          conn?.confirmControl('focus', ok);
+        }
+        break;
+      case 'exposure':
+        if (cmd.value is num) {
+          final applied = await _camera.setExposure((cmd.value as num).toDouble());
+          conn?.confirmControl('exposure', applied);
+        }
+        break;
+      case 'white_balance':
+        if (_camera.whiteBalanceSupported) {
+          conn?.confirmControl('white_balance', cmd.value);
+        } else {
+          conn?.reportUnsupported('white_balance', 'not supported on this device');
+        }
         break;
       case 'torch':
       case 'toggle_torch':
-        _camera.toggleTorch();
+        await _camera.toggleTorch();
+        conn?.confirmControl('torch', _camera.torchOn ? 'on' : 'off');
+        break;
+      case 'flip':
+      case 'switch_camera':
+        if (cmd.value == 'front') {
+          await _camera.switchToPosition(CameraLensDirection.front);
+        } else if (cmd.value == 'back') {
+          await _camera.switchToPosition(CameraLensDirection.back);
+        } else {
+          await _camera.switchCamera();
+        }
+        conn?.sendCapabilities(_camera.capabilities());
+        conn?.confirmControl('flip', _camera.lensDirection.name);
+        break;
+      case 'resolution':
+        if (cmd.value is Map) {
+          final w = (cmd.value['width'] as num?)?.toInt() ?? 1280;
+          final h = (cmd.value['height'] as num?)?.toInt() ?? 720;
+          final applied = await _camera.setResolution(w, h);
+          conn?.confirmControl('resolution', applied);
+        }
+        break;
+      case 'filters':
+      case 'filter_state':
+        if (cmd.value is Map) {
+          setState(() => _filters = CameraFilters.fromJson(cmd.value as Map));
+          await saveFilters(_camera.lensDirection.name, _filters);
+          conn?.confirmControl('filters', _filters.toJson());
+        }
         break;
     }
+  }
+
+  // ── Local filter change → push to desktop + persist ──────────────────────────
+  Future<void> _setFilters(CameraFilters f) async {
+    setState(() => _filters = f);
+    await saveFilters(_camera.lensDirection.name, f);
+    _conn?.sendControl('filters', f.toJson());
   }
 
   Future<void> _applyZoom(double z) async {
     await _camera.setZoom(z);
+    _conn?.desktopZoom(_camera.zoom); // keep desktop software-zoom in sync
     _showZoomIndicator();
   }
 
   void _showZoomIndicator() {
     setState(() => _showZoomBar = true);
-    Future.delayed(const Duration(seconds: 2), () {
-      if (mounted) setState(() => _showZoomBar = false);
-    });
+    Future.delayed(const Duration(seconds: 2), () { if (mounted) setState(() => _showZoomBar = false); });
+  }
+
+  void _ringAt(Offset normalized) {
+    setState(() => _focusPoint = normalized);
+    _focusTimer?.cancel();
+    _focusTimer = Timer(const Duration(milliseconds: 900), () { if (mounted) setState(() => _focusPoint = null); });
+  }
+
+  Future<void> _tapFocus(TapDownDetails d, Size size) async {
+    final nx = (d.localPosition.dx / size.width).clamp(0.0, 1.0);
+    final ny = (d.localPosition.dy / size.height).clamp(0.0, 1.0);
+    await _camera.focusAt(nx, ny);
+    _ringAt(Offset(nx, ny));
+    _conn?.sendControl('focus', {'x': nx, 'y': ny});
   }
 
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
-    // Pause/resume capture with app lifecycle to free the camera cleanly.
-    if (state == AppLifecycleState.inactive ||
-        state == AppLifecycleState.paused) {
+    if (state == AppLifecycleState.inactive || state == AppLifecycleState.paused) {
       _camera.stopStreaming();
     } else if (state == AppLifecycleState.resumed) {
       if (_camera.isInitialized) _camera.startStreaming();
     }
   }
 
-  void _disconnect() {
-    context.read<ConnectionService>().disconnect();
-    if (mounted) Navigator.of(context).pop();
-  }
-
   @override
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
     WakelockPlus.disable();
+    _adaptiveTimer?.cancel();
+    _focusTimer?.cancel();
     _conn?.removeCommandListener(_onRemoteCommand);
+    _conn?.stateProvider = null;
+    _orientation.removeListener(_onOrientation);
+    _orientation.dispose();
     _camera.removeListener(_onCameraChanged);
     _camera.dispose();
     super.dispose();
@@ -132,66 +231,68 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
 
   @override
   Widget build(BuildContext context) {
-    return PopScope(
-      canPop: false,
-      onPopInvokedWithResult: (didPop, _) {
-        if (!didPop) _disconnect();
-      },
-      child: Scaffold(
-        backgroundColor: Colors.black,
-        body: _buildBody(),
-      ),
-    );
-  }
-
-  Widget _buildBody() {
     if (_permissionDenied) return _permissionDeniedView();
     if (_initError != null) return _errorView(_initError!);
     if (_initializing || !_camera.isInitialized) {
       return const Center(
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            CircularProgressIndicator(color: Colors.white),
-            SizedBox(height: 16),
-            Text('Starting camera…', style: TextStyle(color: Colors.white70)),
-          ],
-        ),
+        child: Column(mainAxisSize: MainAxisSize.min, children: [
+          CircularProgressIndicator(color: Colors.white),
+          SizedBox(height: 16),
+          Text('Starting camera…', style: TextStyle(color: Colors.white70)),
+        ]),
       );
     }
 
-    return Stack(
-      fit: StackFit.expand,
-      children: [
-        // Live preview, fills the screen with a centered cover crop.
-        GestureDetector(
-          onScaleStart: (_) => _baseZoom = _camera.zoom,
-          onScaleUpdate: (d) {
-            if (d.scale == 1.0) return;
-            _applyZoom(_baseZoom * d.scale);
-          },
-          child: _buildPreview(),
-        ),
+    return LayoutBuilder(builder: (context, constraints) {
+      final size = Size(constraints.maxWidth, constraints.maxHeight);
+      return Stack(
+        fit: StackFit.expand,
+        children: [
+          GestureDetector(
+            onScaleStart: (_) => _baseZoom = _camera.zoom,
+            onScaleUpdate: (d) { if (d.scale != 1.0) _applyZoom(_baseZoom * d.scale); },
+            onTapDown: (d) => _tapFocus(d, size),
+            child: FilteredPreview(filters: _filters, child: _buildPreview()),
+          ),
 
-        _buildTopBar(),
-        if (_showZoomBar) _buildZoomBar(),
-        _buildControls(),
+          if (_focusPoint != null)
+            Positioned(
+              left: _focusPoint!.dx * size.width - 30,
+              top: _focusPoint!.dy * size.height - 30,
+              child: _FocusRing(),
+            ),
 
-        Consumer<ConnectionService>(
-          builder: (_, conn, __) => ReadingOverlay(text: conn.readingText),
-        ),
-      ],
-    );
+          // Connection badge (top-left)
+          const Positioned(top: 44, left: 16, child: ConnectionBadge()),
+
+          // Torch + flip quick toggles (top-right)
+          Positioned(top: 40, right: 12, child: Row(children: [
+            _circle(_camera.torchOn ? Icons.flash_on : Icons.flash_off,
+                _camera.hasTorch ? () => _camera.toggleTorch() : null),
+            const SizedBox(width: 8),
+            _circle(Icons.cameraswitch, () { _applyZoom(1.0); _camera.switchCamera(); }),
+          ])),
+
+          if (_showZoomBar) _buildZoomBar(),
+
+          // Bottom collapsible panel
+          _buildBottomPanel(),
+
+          // Reading text bar (very bottom)
+          Consumer<ConnectionService>(
+            builder: (_, conn, __) => ReadingOverlay(text: conn.readingText),
+          ),
+        ],
+      );
+    });
   }
 
   Widget _buildPreview() {
     final controller = _camera.controller!;
-    // Cover the full screen without distortion.
     final size = MediaQuery.of(context).size;
     return ClipRect(
       child: OverflowBox(
-        maxWidth: double.infinity,
-        maxHeight: double.infinity,
+        maxWidth: double.infinity, maxHeight: double.infinity,
         child: FittedBox(
           fit: BoxFit.cover,
           child: SizedBox(
@@ -204,267 +305,131 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
     );
   }
 
-  Widget _buildTopBar() {
-    return Positioned(
-      top: 0,
-      left: 0,
-      right: 0,
-      child: Container(
-        padding: const EdgeInsets.fromLTRB(14, 48, 14, 12),
-        color: Colors.black54,
-        child: Row(
-          mainAxisAlignment: MainAxisAlignment.spaceBetween,
-          children: [
-            _circleButton(Icons.close, _disconnect),
-            Consumer<ConnectionService>(
-              builder: (_, conn, __) {
-                final connected = conn.status == ConnectionStatus.connected;
-                return Container(
-                  padding:
-                      const EdgeInsets.symmetric(horizontal: 14, vertical: 6),
-                  decoration: BoxDecoration(
-                    color: Colors.black54,
-                    borderRadius: BorderRadius.circular(20),
-                    border: Border.all(
-                      color: connected ? Colors.green : Colors.red,
-                      width: 1.5,
-                    ),
-                  ),
-                  child: Row(
-                    mainAxisSize: MainAxisSize.min,
-                    children: [
-                      if (connected)
-                        Container(
-                          width: 8,
-                          height: 8,
-                          margin: const EdgeInsets.only(right: 6),
-                          decoration: const BoxDecoration(
-                            color: Colors.green, shape: BoxShape.circle),
-                        ),
-                      Text(
-                        connected
-                            ? '● Live · ${conn.latencyMs}ms'
-                            : conn.status == ConnectionStatus.reconnecting
-                                ? 'Reconnecting…'
-                                : 'Offline',
-                        style: TextStyle(
-                          color: connected ? Colors.green : Colors.red,
-                          fontWeight: FontWeight.bold,
-                          fontSize: 13,
-                        ),
-                      ),
-                    ],
-                  ),
-                );
-              },
-            ),
-            _circleButton(
-              _camera.torchOn ? Icons.flash_on : Icons.flash_off,
-              _camera.hasTorch ? _camera.toggleTorch : null,
-            ),
-          ],
-        ),
-      ),
-    );
-  }
-
   Widget _buildZoomBar() {
     final pct = _camera.maxZoom > _camera.minZoom
-        ? (_camera.zoom - _camera.minZoom) /
-            (_camera.maxZoom - _camera.minZoom)
-        : 0.0;
+        ? (_camera.zoom - _camera.minZoom) / (_camera.maxZoom - _camera.minZoom) : 0.0;
     return Positioned(
-      bottom: 150,
-      left: 0,
-      right: 0,
-      child: Center(
-        child: Container(
-          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
-          decoration: BoxDecoration(
-            color: const Color(0xCC000000),
-            borderRadius: BorderRadius.circular(20),
-            border: Border.all(color: const Color(0x66818CF8)),
-          ),
-          child: Row(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              SizedBox(
-                width: 100,
-                child: ClipRRect(
-                  borderRadius: BorderRadius.circular(2),
-                  child: LinearProgressIndicator(
-                    value: pct.clamp(0.0, 1.0),
-                    backgroundColor: Colors.white24,
-                    valueColor: const AlwaysStoppedAnimation(Color(0xFF818CF8)),
-                    minHeight: 4,
-                  ),
+      bottom: 200, left: 0, right: 0,
+      child: Center(child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+        decoration: BoxDecoration(color: const Color(0xCC000000), borderRadius: BorderRadius.circular(20), border: Border.all(color: const Color(0x66818CF8))),
+        child: Row(mainAxisSize: MainAxisSize.min, children: [
+          SizedBox(width: 100, child: ClipRRect(borderRadius: BorderRadius.circular(2),
+            child: LinearProgressIndicator(value: pct.clamp(0.0, 1.0), backgroundColor: Colors.white24, valueColor: const AlwaysStoppedAnimation(_purple), minHeight: 4))),
+          const SizedBox(width: 10),
+          Text('${_camera.zoom.toStringAsFixed(1)}×', style: const TextStyle(color: _purple, fontWeight: FontWeight.bold)),
+        ]),
+      )),
+    );
+  }
+
+  Widget _buildBottomPanel() {
+    return Positioned(
+      bottom: 0, left: 0, right: 0,
+      child: Container(
+        color: const Color(0x99000000),
+        padding: const EdgeInsets.fromLTRB(12, 8, 12, 30),
+        child: Column(mainAxisSize: MainAxisSize.min, children: [
+          // Header row: zoom slider + filters toggle
+          Row(children: [
+            const Icon(Icons.zoom_in, color: Colors.white54, size: 18),
+            Expanded(child: Slider(
+              value: _camera.zoom.clamp(_camera.minZoom, _camera.maxZoom),
+              min: _camera.minZoom, max: _camera.maxZoom == _camera.minZoom ? _camera.minZoom + 1 : _camera.maxZoom,
+              activeColor: _purple,
+              onChanged: (v) => _applyZoom(v),
+            )),
+            IconButton(
+              icon: Icon(Icons.auto_awesome, color: _showFilters ? _purple : Colors.white70),
+              onPressed: () => setState(() => _showFilters = !_showFilters),
+            ),
+          ]),
+
+          if (_showFilters) ...[
+            SizedBox(height: 44, child: ListView(
+              scrollDirection: Axis.horizontal,
+              children: kFilterPresets.map((p) => Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 4),
+                child: ActionChip(
+                  backgroundColor: const Color(0xFF1E1E32),
+                  label: Text(p.name, style: const TextStyle(color: Colors.white, fontSize: 12)),
+                  onPressed: () => _setFilters(p.filters),
                 ),
-              ),
-              const SizedBox(width: 10),
-              Text(
-                '${_camera.zoom.toStringAsFixed(1)}×',
-                style: const TextStyle(
-                  color: Color(0xFF818CF8),
-                  fontWeight: FontWeight.bold),
-              ),
-            ],
-          ),
-        ),
-      ),
-    );
-  }
-
-  Widget _buildControls() {
-    return Positioned(
-      bottom: 0,
-      left: 0,
-      right: 0,
-      child: Container(
-        padding: const EdgeInsets.fromLTRB(16, 16, 16, 40),
-        color: Colors.black54,
-        child: Row(
-          mainAxisAlignment: MainAxisAlignment.spaceEvenly,
-          children: [
-            _controlButton(Icons.cameraswitch, 'Flip',
-                () { _applyZoom(1.0); _camera.switchCamera(); }),
-            _controlButton(Icons.zoom_out, 'Zoom −',
-                () => _applyZoom(_camera.zoom - 0.5)),
-            _zoomBadge(),
-            _controlButton(Icons.zoom_in, 'Zoom +',
-                () => _applyZoom(_camera.zoom + 0.5)),
-            _facingBadge(),
+              )).toList(),
+            )),
+            _filterSlider('Brightness', _filters.brightness, 0, 200, (v) => _setFilters(_filters.copyWith(brightness: v))),
+            _filterSlider('Contrast', _filters.contrast, 0, 200, (v) => _setFilters(_filters.copyWith(contrast: v))),
+            _filterSlider('Saturation', _filters.saturation, 0, 200, (v) => _setFilters(_filters.copyWith(saturation: v))),
+            _filterSlider('Blur', _filters.blur, 0, 10, (v) => _setFilters(_filters.copyWith(blur: v))),
           ],
-        ),
+        ]),
       ),
     );
   }
 
-  Widget _zoomBadge() {
-    return GestureDetector(
-      onTap: () => _applyZoom(1.0),
-      child: Container(
-        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
-        decoration: BoxDecoration(
-          color: const Color(0x33818CF8),
-          borderRadius: BorderRadius.circular(14),
-          border: Border.all(color: const Color(0xFF818CF8), width: 1.5),
+  Widget _filterSlider(String label, double value, double min, double max, ValueChanged<double> onChanged) => Row(children: [
+        SizedBox(width: 80, child: Text(label, style: const TextStyle(color: Colors.white70, fontSize: 11))),
+        Expanded(child: Slider(value: value.clamp(min, max), min: min, max: max, activeColor: _purple, onChanged: onChanged)),
+        SizedBox(width: 34, child: Text(value.round().toString(), style: const TextStyle(color: Colors.white54, fontSize: 11))),
+      ]);
+
+  Widget _circle(IconData icon, VoidCallback? onTap) => GestureDetector(
+        onTap: onTap,
+        child: Container(
+          width: 42, height: 42,
+          decoration: const BoxDecoration(color: Color(0xBF141423), shape: BoxShape.circle),
+          child: Icon(icon, color: onTap == null ? Colors.white30 : Colors.white, size: 20),
         ),
-        child: Text(
-          '${_camera.zoom.toStringAsFixed(1)}×',
-          style: const TextStyle(
-            color: Color(0xFF818CF8), fontWeight: FontWeight.bold),
-        ),
-      ),
-    );
+      );
+
+  void _disconnect() {
+    context.read<ConnectionService>().disconnect();
+    Navigator.of(context).pushNamedAndRemoveUntil('/', (r) => false);
   }
 
-  Widget _facingBadge() {
-    final isFront = _camera.lensDirection == CameraLensDirection.front;
-    return Column(
-      mainAxisSize: MainAxisSize.min,
-      children: [
-        Icon(isFront ? Icons.person : Icons.camera_rear, color: Colors.white70),
-        const SizedBox(height: 4),
-        Text(isFront ? 'Front' : 'Back',
-            style: const TextStyle(color: Colors.white54, fontSize: 10)),
-      ],
-    );
-  }
-
-  Widget _controlButton(IconData icon, String label, VoidCallback onTap) {
-    return GestureDetector(
-      onTap: onTap,
-      child: Column(
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          Container(
-            width: 48,
-            height: 48,
-            decoration: BoxDecoration(
-              color: const Color(0xD91E1E32),
-              shape: BoxShape.circle,
-              border: Border.all(color: Colors.white24),
-            ),
-            child: Icon(icon, color: Colors.white, size: 22),
-          ),
-          const SizedBox(height: 5),
-          Text(label,
-              style: const TextStyle(color: Colors.white70, fontSize: 10)),
-        ],
-      ),
-    );
-  }
-
-  Widget _circleButton(IconData icon, VoidCallback? onTap) {
-    return GestureDetector(
-      onTap: onTap,
-      child: Container(
-        width: 42,
-        height: 42,
-        decoration: BoxDecoration(
-          color: const Color(0xBF141423),
-          shape: BoxShape.circle,
-          border: Border.all(color: Colors.white24),
-        ),
-        child: Icon(icon,
-            color: onTap == null ? Colors.white30 : Colors.white, size: 20),
-      ),
-    );
-  }
-
-  Widget _permissionDeniedView() {
-    return Center(
-      child: Padding(
+  Widget _permissionDeniedView() => Center(child: Padding(
         padding: const EdgeInsets.all(32),
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            const Icon(Icons.camera_alt, color: Colors.white54, size: 64),
-            const SizedBox(height: 20),
-            const Text('Camera Permission Required',
-                style: TextStyle(
-                    color: Colors.white,
-                    fontSize: 20,
-                    fontWeight: FontWeight.bold),
-                textAlign: TextAlign.center),
-            const SizedBox(height: 12),
-            const Text(
-              'Church Cam needs camera access to stream video to the desktop.',
-              style: TextStyle(color: Colors.white60),
-              textAlign: TextAlign.center,
-            ),
-            const SizedBox(height: 24),
-            ElevatedButton(
-              onPressed: openCameraSettings,
-              child: const Text('Open Settings'),
-            ),
-            TextButton(
-              onPressed: _disconnect,
-              child: const Text('← Back'),
-            ),
-          ],
-        ),
-      ),
-    );
-  }
+        child: Column(mainAxisSize: MainAxisSize.min, children: [
+          const Icon(Icons.camera_alt, color: Colors.white54, size: 64),
+          const SizedBox(height: 20),
+          const Text('Camera Permission Required', style: TextStyle(color: Colors.white, fontSize: 20, fontWeight: FontWeight.bold), textAlign: TextAlign.center),
+          const SizedBox(height: 12),
+          const Text('Church Cam needs camera access to stream video to the desktop.', style: TextStyle(color: Colors.white60), textAlign: TextAlign.center),
+          const SizedBox(height: 24),
+          ElevatedButton(onPressed: openCameraSettings, child: const Text('Open Settings')),
+          TextButton(onPressed: _disconnect, child: const Text('← Back')),
+        ]),
+      ));
 
-  Widget _errorView(String message) {
-    return Center(
-      child: Padding(
+  Widget _errorView(String message) => Center(child: Padding(
         padding: const EdgeInsets.all(32),
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            const Icon(Icons.error_outline, color: Colors.redAccent, size: 64),
-            const SizedBox(height: 20),
-            Text(message,
-                style: const TextStyle(color: Colors.white, fontSize: 16),
-                textAlign: TextAlign.center),
-            const SizedBox(height: 24),
-            ElevatedButton(onPressed: _disconnect, child: const Text('← Back')),
-          ],
+        child: Column(mainAxisSize: MainAxisSize.min, children: [
+          const Icon(Icons.error_outline, color: Colors.redAccent, size: 64),
+          const SizedBox(height: 20),
+          Text(message, style: const TextStyle(color: Colors.white, fontSize: 16), textAlign: TextAlign.center),
+          const SizedBox(height: 24),
+          ElevatedButton(onPressed: _disconnect, child: const Text('← Back')),
+        ]),
+      ));
+}
+
+class _FocusRing extends StatefulWidget {
+  @override
+  State<_FocusRing> createState() => _FocusRingState();
+}
+
+class _FocusRingState extends State<_FocusRing> with SingleTickerProviderStateMixin {
+  late final AnimationController _c = AnimationController(vsync: this, duration: const Duration(milliseconds: 350))..forward();
+
+  @override
+  void dispose() { _c.dispose(); super.dispose(); }
+
+  @override
+  Widget build(BuildContext context) => ScaleTransition(
+        scale: Tween(begin: 1.4, end: 1.0).animate(CurvedAnimation(parent: _c, curve: Curves.easeOut)),
+        child: Container(
+          width: 60, height: 60,
+          decoration: BoxDecoration(shape: BoxShape.circle, border: Border.all(color: _purple, width: 2)),
         ),
-      ),
-    );
-  }
+      );
 }

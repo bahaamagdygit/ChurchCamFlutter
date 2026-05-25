@@ -2,7 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 import 'services/connection_service.dart';
 import 'screens/connect_screen.dart';
-import 'screens/camera_screen.dart';
+import 'screens/home_shell.dart';
 
 void main() {
   WidgetsFlutterBinding.ensureInitialized();
@@ -30,7 +30,7 @@ class ChurchCamApp extends StatelessWidget {
         initialRoute: '/',
         routes: {
           '/': (_) => const ConnectScreen(),
-          '/camera': (_) => const CameraScreen(),
+          '/home': (_) => const HomeShell(),
         },
       ),
     );

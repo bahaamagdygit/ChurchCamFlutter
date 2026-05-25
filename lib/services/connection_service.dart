@@ -2,7 +2,6 @@ import 'package:flutter/foundation.dart';
 import 'dart:async';
 import 'dart:io';
 import 'dart:convert';
-import 'dart:typed_data';
 import 'package:web_socket_channel/web_socket_channel.dart';
 
 enum ConnectionStatus { idle, connecting, connected, error, reconnecting }
@@ -22,6 +21,13 @@ class RemoteCommand {
   final String action;
   final dynamic value;
   const RemoteCommand(this.action, this.value);
+}
+
+/// A camera available on the desktop (from the welcome message).
+class DesktopCamera {
+  final String id;
+  final String label;
+  const DesktopCamera({required this.id, required this.label});
 }
 
 void _log(String message) {
@@ -61,8 +67,10 @@ class ConnectionService extends ChangeNotifier {
   Timer? _reconnectTimer;
   Timer? _pingTimer;
   int _reconnectAttempts = 0;
-  static const int MAX_RECONNECT_ATTEMPTS = 8;
   static const int PING_INTERVAL_MS = 1000;
+  // Heartbeat liveness: 3 consecutive unanswered pings → force reconnect (Section 2).
+  int _missedPongs = 0;
+  static const int MAX_MISSED_PONGS = 3;
 
   // Capabilities advertised to the desktop during handshake.
   Map<String, dynamic> _capabilities = {};
@@ -72,6 +80,11 @@ class ConnectionService extends ChangeNotifier {
   // Reading text overlay pushed from the desktop.
   String _readingText = '';
   List<String> _readingLangs = const [];
+
+  // Desktop state (from welcome / desktop_state).
+  List<DesktopCamera> _desktopCameras = const [];
+  bool _streamLive = false;
+  bool _recording = false;
 
   // Listeners interested in remote commands (CameraScreen subscribes here).
   final List<void Function(RemoteCommand)> _commandListeners = [];
@@ -86,6 +99,9 @@ class ConnectionService extends ChangeNotifier {
   String get readingText => _readingText;
   List<String> get readingLangs => _readingLangs;
   bool get isVideoReady => _videoSocket != null && _videoHeaderSent;
+  List<DesktopCamera> get desktopCameras => _desktopCameras;
+  bool get streamLive => _streamLive;
+  bool get recording => _recording;
 
   void addCommandListener(void Function(RemoteCommand) cb) {
     if (!_commandListeners.contains(cb)) _commandListeners.add(cb);
@@ -101,13 +117,45 @@ class ConnectionService extends ChangeNotifier {
     }
   }
 
+  /// Supplies the full current state for the reconnect "state restore" handshake
+  /// (device name, capabilities, orientation, zoom, filters, colors). Set by the
+  /// CameraScreen so a reconnect immediately restores the desktop's view.
+  Map<String, dynamic> Function()? stateProvider;
+
   /// Set before connecting so the desktop shows a friendly name + the right
   /// zoom slider range.
-  void configure({String? deviceName, Map<String, dynamic>? capabilities}) {
+  void configure({String? deviceName, Map<String, dynamic>? capabilities, int? orientationAngle}) {
     if (deviceName != null && deviceName.trim().isNotEmpty) {
       _deviceName = deviceName.trim();
     }
     if (capabilities != null) _capabilities = capabilities;
+    if (orientationAngle != null) _orientationAngle = orientationAngle;
+  }
+
+  // ── Mobile → desktop controls (Section 5) ────────────────────────────────────
+  // NB: these use the action names the desktop actually handles (see App.tsx
+  // onMobileControl): select_camera, set_zoom, toggle_text, next_slide,
+  // prev_slide, start_stream, stop_stream, start_recording, stop_recording,
+  // cut_to_black.
+  void selectDesktopCamera(String deviceId) => sendControl('select_camera', deviceId);
+  void desktopZoom(double zoom) => sendControl('set_zoom', zoom);
+  void toggleReadingOverlay(bool visible) => sendControl('toggle_text', visible);
+  void nextSlide() => sendControl('next_slide');
+  void prevSlide() => sendControl('prev_slide');
+  void startStream() => sendControl('start_stream');
+  void stopStream() => sendControl('stop_stream');
+  void startRecording() => sendControl('start_recording');
+  void stopRecording() => sendControl('stop_recording');
+  void cutToBlack(bool active) => sendControl('cut_to_black', active);
+
+  /// Confirm an applied control back to the desktop (Section 4).
+  void confirmControl(String controlType, dynamic appliedValue) {
+    _send({'type': 'control_ack', 'control': controlType, 'value': appliedValue});
+  }
+
+  /// Report an unsupported / failed control (Section 11).
+  void reportUnsupported(String controlType, String reason) {
+    _send({'type': 'control_error', 'control': controlType, 'reason': reason});
   }
 
   Future<bool> connect(String host, int controlPort, int videoPort) async {
@@ -191,12 +239,20 @@ class ConnectionService extends ChangeNotifier {
       );
 
       // Send the hello handshake immediately. The desktop replies with welcome.
-      _send({
+      // Merge any extra state (zoom, filters, colors) so a reconnect restores
+      // the desktop's view without operator action.
+      final hello = <String, dynamic>{
         'type': 'hello',
         'name': _deviceName,
+        'platform': 'Android',
         'capabilities': _capabilities,
         'orientationAngle': _orientationAngle,
-      });
+      };
+      try {
+        final extra = stateProvider?.call();
+        if (extra != null) hello.addAll(extra);
+      } catch (_) {}
+      _send(hello);
 
       _startPing();
       return completer.future;
@@ -224,7 +280,20 @@ class ConnectionService extends ChangeNotifier {
       case 'welcome':
         _deviceId = (msg['deviceId'] ?? '').toString();
         if (msg['videoPort'] is int) _videoPort = msg['videoPort'] as int;
+        // Optional desktop state in the welcome (Section 3).
+        if (msg['streamStatus'] != null) _streamLive = msg['streamStatus'] == 'live';
+        if (msg['recordingStatus'] != null) _recording = msg['recordingStatus'] == 'recording';
+        if (msg['desktopCameras'] is List) {
+          _desktopCameras = (msg['desktopCameras'] as List)
+              .whereType<Map>()
+              .map((m) => DesktopCamera(
+                    id: (m['id'] ?? '').toString(),
+                    label: (m['label'] ?? '').toString(),
+                  ))
+              .toList();
+        }
         _log('Welcome: deviceId=$_deviceId videoPort=$_videoPort');
+        notifyListeners();
         onWelcome();
         break;
 
@@ -234,6 +303,7 @@ class ConnectionService extends ChangeNotifier {
         break;
 
       case 'pong':
+        _missedPongs = 0;
         if (msg['t'] is int) {
           _latencyMs = DateTime.now().millisecondsSinceEpoch - (msg['t'] as int);
           _quality = qualityFor(_latencyMs);
@@ -258,10 +328,20 @@ class ConnectionService extends ChangeNotifier {
         notifyListeners();
         break;
 
+      case 'desktop_state': {
+        final v = msg['value'];
+        if (v is Map) {
+          if (v['streamStatus'] != null) _streamLive = v['streamStatus'] == 'live';
+          if (v['recordingStatus'] != null) _recording = v['recordingStatus'] == 'recording';
+          notifyListeners();
+        }
+        _emitCommand(RemoteCommand('desktop_state', v));
+        break;
+      }
+
       case 'filter_state':
-      case 'desktop_state':
-        // Forwarded to listeners for optional handling.
-        _emitCommand(RemoteCommand(msg['type'].toString(), msg['value']));
+        // Desktop pushed a filter update for this camera — hand to listeners.
+        _emitCommand(RemoteCommand('filter_state', msg['value']));
         break;
     }
   }
@@ -307,39 +387,89 @@ class ConnectionService extends ChangeNotifier {
     }
   }
 
+  // Backpressure tracking: how many bytes we've handed to the socket that
+  // haven't been flushed to the OS yet. If this grows, the network is the
+  // bottleneck and we should drop frames rather than queue them (queueing adds
+  // latency that never recovers).
+  int _pendingBytes = 0;
+  bool _flushing = false;
+  // Allow at most ~2 frames' worth of un-flushed data before we start dropping.
+  static const int _maxPendingBytes = 256 * 1024;
+
+  /// True when the socket can accept another frame without building a backlog.
+  /// The camera calls this before encoding so it never wastes CPU on a frame
+  /// the network can't take.
+  bool get canAcceptFrame =>
+      _videoSocket != null && _videoHeaderSent && _pendingBytes < _maxPendingBytes;
+
+  /// Current un-flushed video bytes — used by the adaptive-quality controller.
+  int get pendingVideoBytes => _pendingBytes;
+
   /// Send one JPEG video frame: 4-byte big-endian length prefix + JPEG bytes.
-  /// Frames are dropped (counted) when the channel isn't ready.
+  /// Frames are dropped (counted) when the channel isn't ready or backlogged.
   void sendFrame(Uint8List jpeg) {
     final sock = _videoSocket;
     if (sock == null || !_videoHeaderSent) {
       _framesDropped++;
       return;
     }
+    if (_pendingBytes >= _maxPendingBytes) {
+      // Network can't keep up — drop to stay realtime.
+      _framesDropped++;
+      return;
+    }
     try {
       final len = jpeg.length;
-      final prefix = Uint8List(4)
-        ..[0] = (len >> 24) & 0xFF
-        ..[1] = (len >> 16) & 0xFF
-        ..[2] = (len >> 8) & 0xFF
-        ..[3] = len & 0xFF;
-      sock.add(prefix);
-      sock.add(jpeg);
+      // Single contiguous write (prefix + payload) → one syscall, less overhead.
+      final out = Uint8List(4 + len);
+      out[0] = (len >> 24) & 0xFF;
+      out[1] = (len >> 16) & 0xFF;
+      out[2] = (len >> 8) & 0xFF;
+      out[3] = len & 0xFF;
+      out.setRange(4, 4 + len, jpeg);
+
+      sock.add(out);
+      _pendingBytes += out.length;
       _framesSent++;
-      // Notify sparingly so the UI counter updates without flooding.
-      if (_framesSent % 15 == 0) notifyListeners();
+
+      // Flush and clear the pending counter when the OS has taken the data.
+      if (!_flushing) {
+        _flushing = true;
+        sock.flush().then((_) {
+          _pendingBytes = 0;
+          _flushing = false;
+        }).catchError((_) {
+          _pendingBytes = 0;
+          _flushing = false;
+        });
+      }
+
+      if (_framesSent % 24 == 0) notifyListeners();
     } catch (e) {
       _framesDropped++;
+      _pendingBytes = 0;
+      _flushing = false;
       _log('sendFrame failed: $e');
     }
   }
 
   void _startPing() {
     _pingTimer?.cancel();
+    _missedPongs = 0;
     _pingTimer = Timer.periodic(
       const Duration(milliseconds: PING_INTERVAL_MS),
       (timer) {
         if (_ws == null) {
           timer.cancel();
+          return;
+        }
+        // Count this ping as "unanswered" until a pong resets it. Three in a
+        // row with no reply → the link is dead, force a reconnect.
+        _missedPongs++;
+        if (_missedPongs > MAX_MISSED_PONGS) {
+          _log('Heartbeat timeout ($_missedPongs missed) — forcing reconnect');
+          timer.cancel();
+          _scheduleReconnect();
           return;
         }
         _send({'type': 'ping', 't': DateTime.now().millisecondsSinceEpoch});
@@ -371,17 +501,18 @@ class ConnectionService extends ChangeNotifier {
     _send({'type': 'control', 'action': action, 'value': value});
   }
 
+  // Exponential backoff: 500ms → ×2 → cap 5000ms, retry indefinitely (Section 2).
+  static const int RECONNECT_BASE_MS = 500;
+  static const int RECONNECT_MAX_MS = 5000;
+
   void _scheduleReconnect() {
-    if (_status == ConnectionStatus.idle) return;
+    if (_status == ConnectionStatus.idle) return; // user disconnected
     if (_reconnectTimer?.isActive ?? false) return;
-    if (_reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
-      _log('Max reconnect attempts reached');
-      setStatus(ConnectionStatus.error);
-      return;
-    }
+
     _reconnectAttempts++;
-    final delayMs = (1000 * (1 << (_reconnectAttempts - 1))).clamp(1000, 16000);
-    _log('Reconnecting (attempt $_reconnectAttempts/$MAX_RECONNECT_ATTEMPTS) in ${delayMs}ms');
+    final raw = RECONNECT_BASE_MS * (1 << (_reconnectAttempts - 1).clamp(0, 16));
+    final delayMs = raw.clamp(RECONNECT_BASE_MS, RECONNECT_MAX_MS);
+    _log('Reconnecting (attempt $_reconnectAttempts) in ${delayMs}ms');
     setStatus(ConnectionStatus.reconnecting);
 
     _pingTimer?.cancel();
@@ -389,9 +520,9 @@ class ConnectionService extends ChangeNotifier {
     _ws = null;
 
     _reconnectTimer = Timer(Duration(milliseconds: delayMs), () async {
-      if (_host.isEmpty) return;
+      if (_host.isEmpty || _status == ConnectionStatus.idle) return;
       final ok = await connect(_host, _controlPort, _videoPort);
-      if (!ok) _scheduleReconnect();
+      if (!ok) _scheduleReconnect(); // keep trying forever
     });
   }
 

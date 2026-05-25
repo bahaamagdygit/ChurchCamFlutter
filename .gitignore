@@ -10,6 +10,13 @@ build/
 android/.gradle/
 local.properties
 
+# Release signing — never commit keystore or passwords
+android/key.properties
+android/app/*.keystore
+android/app/*.jks
+*.keystore
+*.jks
+
 # Xcode
 ios/Flutter/Flutter.framework/
 ios/Flutter/Flutter.podspec

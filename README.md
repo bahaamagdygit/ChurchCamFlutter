@@ -1,168 +1,183 @@
-# Church Cam Flutter
+# Church Cam (Flutter)
 
-A professional Flutter-based mobile app for church live streaming with camera feed control.
+LAN-only mobile camera for the Church Live Stream desktop app. The phone streams
+its camera to the desktop over local WiFi — **no internet required**. Control
+flows both ways: the desktop operator can drive the phone camera (zoom, focus,
+exposure, torch, flip, resolution, filters) and the phone can drive the desktop
+(switch camera, slides, stream, recording, cut-to-black, reading overlay).
 
-## Features
+- Control channel: WebSocket on **port 8765**
+- Video channel: raw TCP on **port 8766** (length-prefixed JPEG frames)
+- Discovery: UDP beacons on **port 8767** (auto-find the desktop on the LAN)
 
-✅ **WebSocket Control Channel** - Bidirectional communication with desktop app
-✅ **TCP Video Streaming** - Efficient video frame transmission
-✅ **Auto-Reconnection** - Automatic retry with exponential backoff
-✅ **Real-time Latency** - Live latency monitoring
-✅ **Frame Statistics** - Track sent and dropped frames
-✅ **Cross-Platform** - iOS and Android support
-✅ **LAN & WAN Support** - Works on local network and internet
-✅ **Permission Handling** - Proper camera and network permission management
+---
 
-## Setup Instructions
+## 1. Install Flutter (one time)
 
-### Prerequisites
-
-1. **Flutter SDK** - Download from [flutter.dev](https://flutter.dev/docs/get-started/install)
-2. **Android SDK** - API level 21+ (minSdkVersion: 21)
-3. **Desktop App** - Running on the same network
-
-### Installation
-
-1. **Navigate to project directory**
-   ```bash
-   cd D:\MyProjects\LiveStream\ChurchCamFlutter
+1. Download the Flutter SDK (stable) for Windows:
+   https://docs.flutter.dev/get-started/install/windows
+2. Unzip to a path with **no spaces**, e.g. `C:\flutter` (or `D:\flutter`).
+3. Add `…\flutter\bin` to your **PATH** (System Environment Variables).
+4. Open a new terminal and verify:
+   ```powershell
+   flutter --version
+   flutter doctor
    ```
-
-2. **Install dependencies**
-   ```bash
-   flutter pub get
+5. Accept Android licenses (needs Android SDK / Android Studio installed):
+   ```powershell
+   flutter doctor --android-licenses
    ```
+6. If your Flutter SDK is **not** at `D:\flutter`, edit
+   `android/local.properties` → `flutter.sdk=…`.
 
-3. **Run the app**
-   ```bash
-   flutter run
-   ```
+## 2. Find the desktop IP on Windows
 
-   Or build APK:
-   ```bash
-   flutter build apk --release
-   ```
+On the desktop PC, open a terminal and run:
+```powershell
+ipconfig
+```
+Look under your active WiFi adapter for **IPv4 Address**, e.g. `192.168.1.42`.
+That is the IP you scan/type on the phone. (The desktop app's Mobile Cameras
+panel also shows a QR code that encodes this automatically.)
 
-### Configuration
+## 3. Enable "Unknown sources" on Android
 
-**Local Properties** - Create `local.properties`:
-```properties
-sdk.dir=C:\\Users\\PC\\AppData\\Local\\Android\\Sdk
-flutter.sdk=C:\\path\\to\\flutter
+To install an APK that isn't from the Play Store:
+- Android 8+: when you tap the APK, Android prompts "Allow from this source" for
+  the app you're installing from (Files / Chrome) → enable it.
+- Or: Settings → Apps → Special access → **Install unknown apps** → pick your
+  file manager → allow.
+
+## 4. Generate the release keystore (already done once)
+
+A keystore is already generated at `android/app/churchcam.keystore` and wired via
+`android/key.properties`. To create your own instead:
+```powershell
+& "C:\Program Files\Android\Android Studio\jbr\bin\keytool.exe" -genkeypair -v `
+  -keystore android\app\churchcam.keystore -storetype JKS -keyalg RSA -keysize 2048 `
+  -validity 10000 -alias churchcam -storepass <PASS> -keypass <PASS> `
+  -dname "CN=Church Cam, O=Church Live Stream, C=EG"
+```
+Then set the matching values in `android/key.properties`:
+```
+storePassword=<PASS>
+keyPassword=<PASS>
+keyAlias=churchcam
+storeFile=churchcam.keystore
+```
+> `key.properties` and `*.keystore` are git-ignored — never commit them.
+
+## 5. Build the APK
+
+```powershell
+cd D:\MyProjects\LiveStream\ChurchCamFlutter
+flutter pub get
+flutter build apk --release
+```
+Output (single universal APK):
+```
+build\app\outputs\flutter-apk\app-release.apk
 ```
 
-## Architecture
+## 6. Transfer & install the APK
 
-### Services
-
-**ConnectionService** (`lib/services/connection_service.dart`)
-- Manages WebSocket control channel (port 8765)
-- Manages TCP video socket (port 8766)
-- Handles auto-reconnection with exponential backoff
-- Provides latency monitoring
-
-### Screens
-
-**ConnectScreen** - Connection setup and status
-- IP/port configuration
-- Connection status display
-- Error handling with helpful messages
-
-**CameraScreen** - Live camera feed
-- Real-time camera preview
-- Connection status indicator
-- Frame statistics display
-
-## Protocol
-
-### WebSocket (Port 8765)
-
-```json
-// Hello handshake
-{ "type": "hello", "name": "Mobile Camera (Flutter)", "orientationAngle": 0, "capabilities": {} }
-
-// Welcome response
-{ "type": "welcome", "deviceId": "dev_..." }
-
-// Heartbeat
-{ "type": "ping", "t": 1234567890 }
-{ "type": "pong", "t": 1234567890 }
+**USB (adb):**
+```powershell
+C:\Users\<you>\AppData\Local\Android\Sdk\platform-tools\adb.exe install -r `
+  build\app\outputs\flutter-apk\app-release.apk
 ```
+**Without USB:** copy the APK to the phone (Drive / WhatsApp / USB MTP), tap it in
+the Files app, allow unknown sources, install.
 
-### TCP Video (Port 8766)
+> If you see **"App not installed as package conflicts with an existing package"**,
+> uninstall the old Church Cam first (Settings → Apps → Church Cam → Uninstall),
+> then install the new APK. This happens when the signing key changed.
 
-1. Send **32-byte ASCII deviceId header**
-2. Send frames with **4-byte big-endian length prefix**
-3. Frame format: `[4-byte length][JPEG data][4-byte length][JPEG data]...`
+## 7. Using it
+
+1. Start the desktop **Live** app and open its Mobile Cameras (📱) panel.
+2. On the phone: tap the desktop under **"Found on this network"**, or tap
+   **Scan QR**, or **Add Manually** and type the desktop IP.
+3. Grant camera permission. The phone streams to the desktop.
+4. **Camera** tab = preview + zoom/filters/torch/flip + pinch-zoom + tap-to-focus.
+   **Control** tab = drive the desktop (slides, stream, recording, cut-to-black).
+   **Settings** tab = device name, resolution, ports, disconnect.
+
+---
 
 ## Troubleshooting
 
-### "Can't reach the desktop"
-- ✓ Both devices on same WiFi
-- ✓ Desktop app is running  
-- ✓ IP address is correct
-- ✓ Firewall allows ports 8765 & 8766
+**Camera permission denied**
+The app shows a dedicated screen with an "Open Settings" button. Grant Camera
+permission there, then return to the app.
 
-### Camera permission denied
-- Grant camera permission in app settings
-- Check `AndroidManifest.xml` has `CAMERA` permission
+**Can't connect / "Could not reach"**
+- Both devices must be on the **same WiFi** (and the network must allow
+  device-to-device traffic — some guest/public WiFi blocks it).
+- Confirm the desktop app is running and the IP is correct (`ipconfig`).
+- Windows Firewall: allow inbound TCP **8765** and **8766** for the desktop app.
+- Try the auto-discovered entry under "Found on this network" — it's always
+  the current IP even if the desktop's IP changed.
 
-### Video streaming not working
-- Check network connectivity
-- Verify desktop app is listening on port 8766
-- Check logs for error details
+**Video lag / stutter**
+- The app auto-adapts quality to your WiFi (drops JPEG quality/FPS under load and
+  raises them again when the link is clear).
+- Move closer to the router or use 5GHz WiFi.
+- Other heavy network use on the same WiFi competes for bandwidth.
 
-## Building for Production
+**Image is rotated / sideways**
+- Orientation is sensor-based and sent to the desktop on every rotation, and
+  re-sent on reconnect. If it's ever stuck, rotate the phone once to resync, or
+  disconnect/reconnect.
 
-```bash
-# Build signed APK
-flutter build apk --release
+**White balance "unsupported" warning on the desktop**
+- The Flutter `camera` plugin has no white-balance API, so the phone reports it
+  as unsupported. All other controls (zoom, focus, exposure, torch, flip,
+  resolution, filters) are supported.
 
-# Build App Bundle (for Play Store)
-flutter build appbundle --release
+---
+
+## Architecture (quick map)
+
+```
+lib/
+  main.dart                      app entry + routes (Connect → HomeShell)
+  models/camera_filters.dart     8-param filters + color matrix + presets
+  services/
+    connection_service.dart      WebSocket control + TCP video + heartbeat + reconnect
+    camera_service.dart          camera capture, controls, adaptive quality
+    jpeg_encoder.dart            background isolate: YUV/BGRA → JPEG
+    orientation_service.dart     accelerometer → 0/90/180/270
+    discovery_service.dart       UDP beacon listener
+    storage.dart                 shared_preferences: connections, settings, filters
+  screens/
+    connect_screen.dart          QR scan + discovery + saved + manual
+    qr_scan_screen.dart          mobile_scanner full-screen
+    home_shell.dart              bottom nav: Camera / Control / Settings
+    camera_screen.dart           preview, filters, focus ring, pinch-zoom
+    control_screen.dart          remote-control the desktop
+    settings_screen.dart         device name, resolution, ports, disconnect
+  widgets/
+    connection_badge.dart        latency dot (green/yellow/red)
+    filtered_preview.dart        ColorFiltered + blur overlay
+    reading_overlay.dart         bottom reading-text bar
 ```
 
-APK location: `build/app/outputs/apk/release/app-release.apk`
+## Protocol summary
 
-## Dependencies
+WebSocket (8765), JSON:
+```
+phone → { type:'hello', name, platform:'Android', capabilities, orientationAngle, zoom, filters }
+desk  → { type:'welcome', deviceId, videoPort, streamStatus, recordingStatus, desktopCameras }
+both  → { type:'ping'|'pong', t }                     # heartbeat / latency
+desk  → { type:'command', action, value }             # zoom/focus/exposure/torch/flip/resolution/filters
+phone → { type:'control_ack', control, value }        # applied confirmation
+phone → { type:'control_error', control, reason }     # unsupported
+phone → { type:'control', action, value }             # select_camera/set_zoom/next_slide/start_stream/cut_to_black/…
+phone → { type:'orientation_change', angle }
+desk  → { type:'reading_update', text, langs }
+```
+TCP (8766): 32-byte ASCII deviceId header, then repeating `[4-byte BE length][JPEG bytes]`.
 
-- **camera** - Camera access and preview
-- **web_socket_channel** - WebSocket communication
-- **provider** - State management
-- **permission_handler** - Runtime permissions
-- **logger** - Logging utility
-- **shared_preferences** - Local storage
-
-## Performance
-
-- **Latency**: Real-time monitoring via heartbeat pings
-- **Frame Rate**: Configurable based on network conditions
-- **Auto-Reconnection**: Exponential backoff (1s, 2s, 4s, 8s, 16s max)
-- **Resource Usage**: Minimal CPU/memory footprint
-
-## Known Limitations
-
-- Max 5 reconnection attempts (configurable)
-- Frame queue capacity: 2 frames (prevents latency buildup)
-- Video frames are dropped under poor WiFi (graceful degradation)
-
-## Future Enhancements
-
-- [ ] Frame compression optimization
-- [ ] Adaptive bitrate streaming
-- [ ] Multi-camera support
-- [ ] Recording capability
-- [ ] Remote PTZ control
-- [ ] iOS optimization
-
-## Support
-
-For issues or questions, check:
-1. Connection logs in console
-2. Desktop app configuration
-3. Network settings
-4. Firewall rules
-
-## License
-
-Proprietary - Church Live Stream Studio
+> Note: action names use the desktop's vocabulary (`next_slide`, `start_stream`,
+> `cut_to_black`, etc.) so controls work against the existing desktop app.
