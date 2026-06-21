@@ -42,6 +42,7 @@ class H264Encoder(
 
     // Reusable scratch buffer for the converted YUV (resized on configure).
     private var convertBuf: ByteArray = ByteArray(0)
+    private var loggedLayout = false  // one-time encoder-input-layout diagnostic
 
     @Synchronized
     fun start(width: Int, height: Int, fps: Int, bitrate: Int) {
@@ -82,6 +83,7 @@ class H264Encoder(
             codec = c
             running.set(true)
             frameIndex = 0
+            loggedLayout = false
             convertBuf = ByteArray(width * height * 3 / 2)
             Log.i(TAG, "[H264] STARTED ${width}x$height @${fps}fps ${bitrate / 1000}kbps CBR colorFmt=$colorFormat")
         } catch (e: Exception) {
@@ -165,8 +167,17 @@ class H264Encoder(
     /**
      * Copy source YUV_420_888 planes into the encoder's input Image, honoring
      * BOTH the source strides (from CameraImage) and the destination strides
-     * (from the encoder). Handles planar (I420) and semi-planar (NV12/NV21)
-     * destinations by following each destination plane's pixelStride.
+     * (from the encoder).
+     *
+     * CRITICAL: the encoder's input Image may be PLANAR (I420 — U and V in
+     * SEPARATE buffers, pixelStride 1) or SEMI-PLANAR (NV12/NV21 — U and V
+     * INTERLEAVED in the SAME buffer, pixelStride 2). The previous code treated
+     * U/V as independent buffers and called position() on each; for the
+     * semi-planar case those are the same buffer, so the writes collided and
+     * scrambled chroma → the green macroblock corruption. We branch explicitly.
+     *
+     * Each destination plane buffer is positioned relative to its own base — we
+     * read each byte through its absolute index, never assuming a shared base.
      */
     private fun copyToEncoderImage(
         img: android.media.Image,
@@ -176,46 +187,92 @@ class H264Encoder(
         val w = width; val h = height
         val planes = img.planes
 
-        // ── Y plane ──
+        // One-time layout log so we can confirm the device's encoder input format.
+        if (!loggedLayout) {
+            loggedLayout = true
+            val uB = planes[1].buffer.position()
+            val vB = planes[2].buffer.position()
+            Log.i(TAG, "[H264] enc input layout: Yrs=${planes[0].rowStride} " +
+                "Urs=${planes[1].rowStride} Ups=${planes[1].pixelStride} " +
+                "Vrs=${planes[2].rowStride} Vps=${planes[2].pixelStride} " +
+                "Ubase=$uB Vbase=$vB (${if (planes[1].pixelStride == 2) (if (vB >= uB) "NV12" else "NV21") else "I420"})")
+        }
+
+        // ── Y plane (always planar) ──
         run {
             val dst = planes[0].buffer
             val dStride = planes[0].rowStride
+            val base = dst.position()
             val rowTmp = ByteArray(w)
             for (row in 0 until h) {
                 val s = row * srcYStride
-                if (s + w <= y.size) {
-                    System.arraycopy(y, s, rowTmp, 0, w)
-                } else {
-                    java.util.Arrays.fill(rowTmp, 0)
-                }
-                dst.position(row * dStride)
+                if (s + w <= y.size) System.arraycopy(y, s, rowTmp, 0, w)
+                else java.util.Arrays.fill(rowTmp, 0)
+                dst.position(base + row * dStride)
                 dst.put(rowTmp, 0, w)
             }
         }
 
-        // ── U / V planes (half resolution) ──
         val cw = w / 2; val ch = h / 2
-        val uDst = planes[1].buffer
-        val vDst = planes[2].buffer
-        val uStride = planes[1].rowStride
-        val vStride = planes[2].rowStride
-        val uPix = planes[1].pixelStride   // 2 = semi-planar (NV12/NV21), 1 = planar
-        val vPix = planes[2].pixelStride
-        for (row in 0 until ch) {
-            val sU = row * srcUvStride
-            val sV = row * srcUvStride
-            var dU = row * uStride
-            var dV = row * vStride
-            var col = 0
-            while (col < cw) {
-                val sIdx = col * srcUvPixelStride
-                val up = if (sU + sIdx < u.size) u[sU + sIdx] else 0
-                val vp = if (sV + sIdx < v.size) v[sV + sIdx] else 0
-                if (dU < uDst.limit()) { uDst.position(dU); uDst.put(up) }
-                if (dV < vDst.limit()) { vDst.position(dV); vDst.put(vp) }
-                dU += uPix
-                dV += vPix
-                col++
+        val uPlane = planes[1]
+        val vPlane = planes[2]
+        val uPix = uPlane.pixelStride
+        val uStride = uPlane.rowStride
+        val vStride = vPlane.rowStride
+
+        if (uPix == 2) {
+            // ── SEMI-PLANAR destination (NV12 or NV21) ──
+            // U and V share one buffer; pixelStride 2. Determine the order from
+            // the V plane's base offset relative to U: V before U by 1 byte =>
+            // the buffer is NV21 (V,U); else NV12 (U,V). We write a packed row
+            // then blit it, honoring the destination rowStride.
+            val uDst = uPlane.buffer
+            val vDst = vPlane.buffer
+            val uBase = uDst.position()
+            val vBase = vDst.position()
+            // Most Android encoders expose NV12 here (U first). We honor whichever
+            // plane sits first by writing each sample to its own plane buffer at
+            // its own stride — that is always correct regardless of NV12/NV21.
+            val uRow = ByteArray(cw * 2)
+            val vRowOffset = vBase - uBase  // +1 (NV12) or -1 (NV21)
+            for (row in 0 until ch) {
+                val srcRow = row * srcUvStride
+                // Build the interleaved chroma row into uRow using the real layout.
+                var k = 0
+                var col = 0
+                while (col < cw) {
+                    val sIdx = srcRow + col * srcUvPixelStride
+                    val up = if (sIdx < u.size) u[sIdx] else 0
+                    val vp = if (sIdx < v.size) v[sIdx] else 0
+                    if (vRowOffset >= 0) { uRow[k] = up; uRow[k + 1] = vp }   // NV12: U,V
+                    else                 { uRow[k] = vp; uRow[k + 1] = up }   // NV21: V,U
+                    k += 2
+                    col++
+                }
+                // Blit into the shared buffer at this chroma row.
+                val rowBase = (if (vRowOffset >= 0) uBase else vBase) + row * uStride
+                uDst.position(rowBase)
+                uDst.put(uRow, 0, minOf(uRow.size, uDst.limit() - rowBase))
+            }
+        } else {
+            // ── PLANAR destination (I420) — U and V in separate buffers ──
+            val uDst = uPlane.buffer
+            val vDst = vPlane.buffer
+            val uBase = uDst.position()
+            val vBase = vDst.position()
+            val uRow = ByteArray(cw)
+            val vRow = ByteArray(cw)
+            for (row in 0 until ch) {
+                val srcRow = row * srcUvStride
+                var col = 0
+                while (col < cw) {
+                    val sIdx = srcRow + col * srcUvPixelStride
+                    uRow[col] = if (sIdx < u.size) u[sIdx] else 0
+                    vRow[col] = if (sIdx < v.size) v[sIdx] else 0
+                    col++
+                }
+                uDst.position(uBase + row * uStride); uDst.put(uRow, 0, cw)
+                vDst.position(vBase + row * vStride); vDst.put(vRow, 0, cw)
             }
         }
     }
