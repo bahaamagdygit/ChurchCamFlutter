@@ -141,6 +141,11 @@ class ConnectionService extends ChangeNotifier {
   /// CameraScreen so a reconnect immediately restores the desktop's view.
   Map<String, dynamic> Function()? stateProvider;
 
+  /// Called whenever the video socket (re)connects. The camera screen uses this
+  /// to force an H.264 config+keyframe so a freshly-attached desktop decoder can
+  /// initialize immediately.
+  void Function()? onVideoReady;
+
   /// Set before connecting so the desktop shows a friendly name + the right
   /// zoom slider range.
   void configure({String? deviceName, Map<String, dynamic>? capabilities, int? orientationAngle}) {
@@ -379,6 +384,11 @@ class ConnectionService extends ChangeNotifier {
         // Desktop pushed a filter update for this camera — hand to listeners.
         _emitCommand(RemoteCommand('filter_state', msg['value']));
         break;
+
+      case 'rx_stats':
+        // Desktop receive/decoder health for the ABR controller.
+        _emitCommand(RemoteCommand('rx_stats', msg['value']));
+        break;
     }
   }
 
@@ -399,6 +409,11 @@ class ConnectionService extends ChangeNotifier {
       _videoSocket!.add(header);
       _videoHeaderSent = true;
       _log('Video stream connected ✓ (header sent)');
+
+      // H.264: a fresh video socket has no decoder state on the desktop. Ask the
+      // encoder to emit a new config (SPS/PPS) + keyframe immediately so the
+      // desktop decoder can (re)initialize without waiting ~1s for the next IDR.
+      try { onVideoReady?.call(); } catch (_) {}
 
       _videoSocket!.listen(
         (_) {},

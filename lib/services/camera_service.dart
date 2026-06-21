@@ -76,6 +76,11 @@ class CameraService extends ChangeNotifier {
   double get avgEncodeMs => _avgEncodeMs;
   int get measuredFps => _measuredFps;
 
+  /// Human-readable current quality, e.g. "720p H.264" or "854w JPEG q60".
+  String get qualityLabel => _h264Mode
+      ? '${_h264Height}p H.264'
+      : '${_maxOutWidth}w JPEG q$_jpegQuality';
+
   // ── Getters ────────────────────────────────────────────────────────────────
   CameraController? get controller => _controller;
   bool get isInitialized => _controller?.value.isInitialized ?? false;

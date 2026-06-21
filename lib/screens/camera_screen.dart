@@ -5,12 +5,14 @@ import 'package:provider/provider.dart';
 import 'package:wakelock_plus/wakelock_plus.dart';
 import '../services/connection_service.dart';
 import '../services/camera_service.dart';
+import '../services/abr_controller.dart';
 import '../services/orientation_service.dart';
 import '../services/storage.dart';
 import '../models/camera_filters.dart';
 import '../utils/permissions.dart';
 import '../widgets/reading_overlay.dart';
 import '../widgets/connection_badge.dart';
+import '../widgets/metrics_overlay.dart';
 import '../widgets/filtered_preview.dart';
 
 const _purple = Color(0xFF818CF8);
@@ -43,6 +45,8 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
 
   Timer? _adaptiveTimer;
   ConnectionService? _conn;
+  AbrController? _abr;
+  bool _showMetrics = false;
 
   @override
   void initState() {
@@ -91,17 +95,35 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
       );
     };
     // If the desktop negotiated h264, switch the camera into hardware-encode
-    // mode (default 720p; the ABR controller may raise/lower this later).
+    // mode (default 720p; the ABR controller raises/lowers this live).
     if (_conn?.videoCodec == 'h264') {
       await _camera.setH264Mode(true, width: 1280, height: 720, bitrate: 3000000);
+      _abr = AbrController(
+        startTier: 1, // 720p30
+        onTierChange: (t) async {
+          // Resolution/fps change → restart the encoder at the new tier.
+          await _camera.setH264Mode(true, width: t.width, height: t.height, bitrate: t.bitrate);
+          await _camera.requestH264Keyframe();
+        },
+        onBitrate: (br) => _camera.updateH264Bitrate(br),
+      );
     }
+    // On every (re)connect of the video socket, force a fresh config+keyframe so
+    // the desktop decoder can initialize without a stall.
+    _conn?.onVideoReady = () => _camera.requestH264Keyframe();
 
     await _camera.startStreaming();
     _camera.addListener(_onCameraChanged);
 
-    // Adaptive-quality tick (Section 6): feed socket backlog every 500ms.
-    _adaptiveTimer = Timer.periodic(const Duration(milliseconds: 500), (_) {
-      _camera.reportBacklog(_conn?.pendingVideoBytes ?? 0);
+    // Adaptive-quality tick: h264 drives the ABR ladder; mjpeg uses the legacy
+    // per-frame quality nudge. Runs every 1s for ABR / 500ms for mjpeg backlog.
+    _adaptiveTimer = Timer.periodic(const Duration(milliseconds: 1000), (_) {
+      final abr = _abr;
+      if (abr != null && _camera.isH264Mode) {
+        abr.tick(pendingBytes: _conn?.pendingVideoBytes ?? 0, targetFps: _camera.targetFps);
+      } else {
+        _camera.reportBacklog(_conn?.pendingVideoBytes ?? 0);
+      }
     });
 
     if (mounted) setState(() => _initializing = false);
@@ -125,6 +147,17 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
   Future<void> _onRemoteCommand(RemoteCommand cmd) async {
     final conn = _conn;
     switch (cmd.action) {
+      case 'rx_stats':
+        // Desktop receive/decoder health → feed the ABR controller.
+        final v = cmd.value;
+        if (v is Map && _abr != null) {
+          _abr!.updateRxStats(RxStats(
+            decodeFps: (v['decodeFps'] as num?)?.toDouble() ?? 0,
+            queueDepth: (v['queueDepth'] as num?)?.toInt() ?? 0,
+            frameAgeMs: (v['frameAgeMs'] as num?)?.toDouble() ?? 0,
+          ));
+        }
+        break;
       case 'set_zoom':
       case 'zoom':
         if (cmd.value is num) {
@@ -238,8 +271,10 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
     WakelockPlus.disable();
     _adaptiveTimer?.cancel();
     _focusTimer?.cancel();
+    _abr?.dispose();
     _conn?.removeCommandListener(_onRemoteCommand);
     _conn?.stateProvider = null;
+    _conn?.onVideoReady = null;
     _orientation.removeListener(_onOrientation);
     _orientation.dispose();
     _camera.removeListener(_onCameraChanged);
@@ -280,8 +315,18 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
               child: _FocusRing(),
             ),
 
-          // Connection badge (top-left)
-          const Positioned(top: 44, left: 16, child: ConnectionBadge()),
+          // Connection badge (top-left) — tap to toggle the full metrics HUD.
+          Positioned(
+            top: 44, left: 16,
+            child: GestureDetector(
+              onTap: () => setState(() => _showMetrics = !_showMetrics),
+              child: const ConnectionBadge(),
+            ),
+          ),
+
+          // Metrics HUD (top-left, under the badge)
+          if (_showMetrics)
+            Positioned(top: 84, left: 16, child: MetricsOverlay(camera: _camera)),
 
           // Torch + flip quick toggles (top-right)
           Positioned(top: 40, right: 12, child: Row(children: [
