@@ -30,6 +30,8 @@ class CameraService extends ChangeNotifier {
   final H264EncoderChannel _h264 = H264EncoderChannel();
   bool _h264Mode = false;
   bool _h264Started = false;
+  bool _h264NeedsStart = false; // start encoder from the next frame's real size
+  bool _h264Starting = false;
   // Target encode size for H.264 (the ladder picks this; default 720p).
   int _h264Width = 1280;
   int _h264Height = 720;
@@ -76,9 +78,9 @@ class CameraService extends ChangeNotifier {
   double get avgEncodeMs => _avgEncodeMs;
   int get measuredFps => _measuredFps;
 
-  /// Human-readable current quality, e.g. "720p H.264" or "854w JPEG q60".
+  /// Human-readable current quality, e.g. "1920x1080 H.264" or "854w JPEG q60".
   String get qualityLabel => _h264Mode
-      ? '${_h264Height}p H.264'
+      ? (_h264Started ? '${_h264Width}x$_h264Height H.264' : 'H.264 starting…')
       : '${_maxOutWidth}w JPEG q$_jpegQuality';
 
   // ── Getters ────────────────────────────────────────────────────────────────
@@ -156,25 +158,60 @@ class CameraService extends ChangeNotifier {
     };
   }
 
-  /// Enable/disable H.264 hardware-encode mode. When enabling, the native
-  /// encoder is started at the current target size; AUs arrive via [onH264Au].
-  /// When disabling, falls back to the Dart JPEG path.
+  // The encoder is configured from the FIRST frame's real dimensions, not a
+  // guessed size — feeding MediaCodec a size that doesn't match the camera's
+  // YUV buffer produces garbled output. We remember the requested ceiling
+  // (resolution tier) only to choose the capture preset + bitrate.
+  int _h264TargetBitrate = 6000000;
+
+  /// Enable/disable H.264 hardware-encode mode. The native encoder is started
+  /// LAZILY from the first frame's actual width/height (see [_onCameraImage]),
+  /// so it always matches the camera. [width]/[height] select the capture preset
+  /// (quality ceiling); [bitrate] sets the encoder target.
   Future<void> setH264Mode(bool enabled, {int? width, int? height, int? bitrate}) async {
-    if (width != null) _h264Width = width;
-    if (height != null) _h264Height = height;
-    if (bitrate != null) _h264Bitrate = bitrate;
-    if (enabled == _h264Mode && _h264Started) return;
+    if (bitrate != null) _h264TargetBitrate = bitrate;
+    _h264Bitrate = _h264TargetBitrate;
+
+    // Pick a capture preset matching the requested tier. For H.264 we WANT a
+    // high-res sensor frame (the old 'medium' was only to spare the Dart-JPEG
+    // CPU; the hardware encoder has the headroom for 1080p).
+    bool presetChanged = false;
+    if (enabled) {
+      final target = (height ?? 1080);
+      final newPreset = target >= 1080
+          ? ResolutionPreset.veryHigh   // 1080p
+          : target >= 720
+              ? ResolutionPreset.high    // 720p
+              : ResolutionPreset.medium; // 480p
+      if (newPreset != _preset) {
+        _preset = newPreset;
+        presetChanged = true;
+      }
+    }
+
+    if (enabled == _h264Mode && _h264Started && !presetChanged) {
+      // Already running at this resolution — just retune bitrate live.
+      if (bitrate != null) await _h264.setBitrate(_h264Bitrate);
+      return;
+    }
+
+    // Resolution change (ABR tier) on a running encoder: stop it, re-open the
+    // camera at the new capture size, and re-prime from the next frame.
+    if (presetChanged) {
+      if (_h264Started || _h264NeedsStart) { await _h264.stop(); _h264Started = false; }
+      await _startController();
+    }
+
     _h264Mode = enabled;
     if (enabled) {
       _h264.onAu = (au) => onH264Au?.call(au);
       _h264.onError = (r) => debugPrint('[CameraService] h264 error: $r');
-      _h264Started = await _h264.start(
-        width: _h264Width, height: _h264Height,
-        fps: _targetFps, bitrate: _h264Bitrate,
-      );
-      debugPrint('[CameraService] H.264 mode ${_h264Started ? "started" : "FAILED"} '
-          '${_h264Width}x$_h264Height @${_targetFps}fps ${_h264Bitrate}bps');
+      // Defer encoder start until the first frame so we encode at the camera's
+      // true resolution. Reset so _onCameraImage re-inits.
+      _h264Started = false;
+      _h264NeedsStart = true;
     } else {
+      _h264NeedsStart = false;
       await _h264.stop();
       _h264Started = false;
     }
@@ -229,6 +266,27 @@ class CameraService extends ChangeNotifier {
     // Send YUV planes straight to the native hardware encoder. No Dart encode,
     // no isolate. Network backpressure still applies (skip if the socket can't
     // take more). The native side handles its own input-buffer backpressure.
+
+    // Lazy encoder start: configure MediaCodec from the FIRST frame's real
+    // dimensions so encoder size always matches the camera's YUV buffer.
+    if (_h264Mode && _h264NeedsStart && !_h264Starting) {
+      if (image.format.group != ImageFormatGroup.yuv420 || image.planes.length < 3) return;
+      _h264Starting = true;
+      // H.264 wants even dimensions; round down to a multiple of 2.
+      final w = image.width & ~1;
+      final h = image.height & ~1;
+      _h264Width = w;
+      _h264Height = h;
+      _h264.start(width: w, height: h, fps: _targetFps, bitrate: _h264Bitrate).then((ok) {
+        _h264Started = ok;
+        _h264NeedsStart = false;
+        _h264Starting = false;
+        debugPrint('[CameraService] H.264 ${ok ? "started" : "FAILED"} '
+            '${w}x$h @${_targetFps}fps ${_h264Bitrate}bps (from live frame)');
+      });
+      return; // this frame primes the encoder; encode from the next one
+    }
+
     if (_h264Mode && _h264Started) {
       if (canSendFrame != null && !canSendFrame!()) return;
       if (image.format.group != ImageFormatGroup.yuv420 || image.planes.length < 3) return;
