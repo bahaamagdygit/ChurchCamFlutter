@@ -108,10 +108,12 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
     // of crashing the screen (which would look like a connect/disconnect storm).
     if (_conn?.videoCodec == 'h264') {
       try {
-        // 1080p30 default; ABR retunes bitrate live (never re-opens the camera).
-        await _camera.setH264Mode(true, width: 1920, height: 1080, fps: 30, bitrate: 6000000);
+        // Start CONSERVATIVE (720p30 @ 2.5Mbps). Starting too high saturates the
+        // WiFi, delays heartbeat pings → heartbeat_timeout → reconnect storm.
+        // The ABR controller climbs to 1080p only once the link proves stable.
+        await _camera.setH264Mode(true, width: 1280, height: 720, fps: 30, bitrate: 2500000);
         _abr = AbrController(
-          startTier: 1, // 1080p30 in the ladder
+          startTier: 3, // 720p30 in the ladder
           onTierChange: (t) async {
             await _camera.setH264Mode(true, width: t.width, height: t.height, fps: t.fps, bitrate: t.bitrate);
             await _camera.requestH264Keyframe();

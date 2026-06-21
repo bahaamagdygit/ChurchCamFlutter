@@ -57,12 +57,12 @@ class CameraService extends ChangeNotifier {
   // instead of continuously hunting (important for a fixed church shot).
   bool _focusLocked = false;
   bool _exposureLocked = false;
-  // Capture at 1080p so the H.264 hardware encoder gets a full-res frame. (The
-  // MJPEG fallback downscales to _maxOutWidth anyway, so this costs only a
-  // slightly larger YUV read there.) Starting high avoids re-opening the camera
-  // mid-stream when H.264 mode turns on — that re-open was causing a connect/
-  // disconnect storm on device.
-  ResolutionPreset _preset = ResolutionPreset.veryHigh;
+  // Capture at 720p — a stable sweet spot for H.264 over WiFi. 1080p saturated
+  // the link and triggered a heartbeat-timeout reconnect spiral. The encoder
+  // encodes the real capture size, so capture == encode == 720p. (MJPEG fallback
+  // still downscales to _maxOutWidth.) Fixed at init so the camera never
+  // re-opens mid-stream (which previously caused a connect/disconnect storm).
+  ResolutionPreset _preset = ResolutionPreset.high;
 
   void Function(Uint8List jpeg)? onJpegFrame;
   /// Optional: lets the screen apply network backpressure. Return false to make
@@ -228,8 +228,15 @@ class CameraService extends ChangeNotifier {
     if (_h264Mode && _h264Started) await _h264.setBitrate(bitrate);
   }
 
+  // Rate-limit keyframe requests — spamming them floods the link with huge IDR
+  // frames (the original lag/black cause). At most one forced keyframe / 2s.
+  DateTime _lastKeyframeReq = DateTime.fromMillisecondsSinceEpoch(0);
   Future<void> requestH264Keyframe() async {
-    if (_h264Mode && _h264Started) await _h264.requestKeyframe();
+    if (!_h264Mode || !_h264Started) return;
+    final now = DateTime.now();
+    if (now.difference(_lastKeyframeReq).inMilliseconds < 2000) return;
+    _lastKeyframeReq = now;
+    await _h264.requestKeyframe();
   }
 
   Future<void> startStreaming() async {

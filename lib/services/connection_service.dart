@@ -73,7 +73,10 @@ class ConnectionService extends ChangeNotifier {
   static const int PING_INTERVAL_MS = 1000;
   // Heartbeat liveness: 3 consecutive unanswered pings → force reconnect (Section 2).
   int _missedPongs = 0;
-  static const int MAX_MISSED_PONGS = 3;
+  // Tolerant of brief stalls (large H.264 keyframes can delay a pong). 6 misses
+  // (≈6s) before forcing a reconnect, matching the desktop side — prevents a
+  // reconnect spiral that restarts the encoder and floods the link.
+  static const int MAX_MISSED_PONGS = 6;
 
   // Capabilities advertised to the desktop during handshake.
   Map<String, dynamic> _capabilities = {};
