@@ -57,10 +57,12 @@ class CameraService extends ChangeNotifier {
   // instead of continuously hunting (important for a fixed church shot).
   bool _focusLocked = false;
   bool _exposureLocked = false;
-  // Capture at a MODEST sensor resolution so the YUV buffer we iterate is small.
-  // A huge sensor frame is the main cause of per-frame CPU lag; medium keeps the
-  // source ~720x480-class and the in-read downscale does the rest.
-  ResolutionPreset _preset = ResolutionPreset.medium;
+  // Capture at 1080p so the H.264 hardware encoder gets a full-res frame. (The
+  // MJPEG fallback downscales to _maxOutWidth anyway, so this costs only a
+  // slightly larger YUV read there.) Starting high avoids re-opening the camera
+  // mid-stream when H.264 mode turns on — that re-open was causing a connect/
+  // disconnect storm on device.
+  ResolutionPreset _preset = ResolutionPreset.veryHigh;
 
   void Function(Uint8List jpeg)? onJpegFrame;
   /// Optional: lets the screen apply network backpressure. Return false to make
@@ -181,39 +183,25 @@ class CameraService extends ChangeNotifier {
   Future<void> setH264Mode(bool enabled, {int? width, int? height, int? fps, int? bitrate}) async {
     if (bitrate != null) _h264TargetBitrate = bitrate;
     _h264Bitrate = _h264TargetBitrate;
-    // A target-fps change is treated like a resolution change (encoder restart).
     final fpsChanged = fps != null && fps != _targetFps;
     if (fps != null) _targetFps = fps.clamp(_minFps, 60);
 
-    // Pick a capture preset matching the requested tier. For H.264 we WANT a
-    // high-res sensor frame (the old 'medium' was only to spare the Dart-JPEG
-    // CPU; the hardware encoder has the headroom for 1080p).
-    bool presetChanged = false;
-    if (enabled) {
-      final target = (height ?? 1080);
-      final newPreset = target >= 1080
-          ? ResolutionPreset.veryHigh   // 1080p
-          : target >= 720
-              ? ResolutionPreset.high    // 720p
-              : ResolutionPreset.medium; // 480p
-      if (newPreset != _preset) {
-        _preset = newPreset;
-        presetChanged = true;
-      }
-    }
+    // IMPORTANT: never re-open the camera here. The camera always captures at
+    // 1080p (_preset). Re-initializing the controller mid-stream caused a
+    // connect/disconnect storm on device. ABR tiers below 1080p simply lower the
+    // ENCODER bitrate (live, no restart); the encoder always encodes the real
+    // capture size. So `width`/`height` only affect bitrate selection here.
 
-    if (enabled == _h264Mode && _h264Started && !presetChanged && !fpsChanged) {
-      // Already running at this resolution/fps — just retune bitrate live.
+    if (enabled == _h264Mode && _h264Started && !fpsChanged) {
+      // Already running — just retune bitrate live.
       if (bitrate != null) await _h264.setBitrate(_h264Bitrate);
       return;
     }
 
-    // Resolution change (ABR tier) → re-open the camera at the new capture size.
-    // An fps-only change just needs an encoder restart (camera image-stream rate
-    // is best-effort; the encoder's KEY_FRAME_RATE is what we control).
-    if (presetChanged || fpsChanged) {
-      if (_h264Started || _h264NeedsStart) { await _h264.stop(); _h264Started = false; }
-      if (presetChanged) await _startController();
+    // An fps change needs an encoder restart (re-primed from the next frame).
+    if (fpsChanged && (_h264Started || _h264NeedsStart)) {
+      await _h264.stop();
+      _h264Started = false;
     }
 
     _h264Mode = enabled;

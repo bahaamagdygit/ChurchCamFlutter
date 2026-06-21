@@ -104,20 +104,23 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
       );
     };
     // If the desktop negotiated h264, switch the camera into hardware-encode
-    // mode (default 720p; the ABR controller raises/lowers this live).
+    // mode. Wrapped so an encoder/camera failure falls back gracefully instead
+    // of crashing the screen (which would look like a connect/disconnect storm).
     if (_conn?.videoCodec == 'h264') {
-      // Start at 1080p30 (a safe high-quality default); the ABR controller can
-      // climb to 1080p60 if the WiFi is strong, or step down under congestion.
-      await _camera.setH264Mode(true, width: 1920, height: 1080, fps: 30, bitrate: 6000000);
-      _abr = AbrController(
-        startTier: 1, // 1080p30 in the new ladder
-        onTierChange: (t) async {
-          // Resolution/fps change → restart the encoder at the new tier.
-          await _camera.setH264Mode(true, width: t.width, height: t.height, fps: t.fps, bitrate: t.bitrate);
-          await _camera.requestH264Keyframe();
-        },
-        onBitrate: (br) => _camera.updateH264Bitrate(br),
-      );
+      try {
+        // 1080p30 default; ABR retunes bitrate live (never re-opens the camera).
+        await _camera.setH264Mode(true, width: 1920, height: 1080, fps: 30, bitrate: 6000000);
+        _abr = AbrController(
+          startTier: 1, // 1080p30 in the ladder
+          onTierChange: (t) async {
+            await _camera.setH264Mode(true, width: t.width, height: t.height, fps: t.fps, bitrate: t.bitrate);
+            await _camera.requestH264Keyframe();
+          },
+          onBitrate: (br) => _camera.updateH264Bitrate(br),
+        );
+      } catch (e) {
+        debugPrint('[CameraScreen] H.264 setup failed, staying on MJPEG: $e');
+      }
     }
     // On every (re)connect of the video socket, force a fresh config+keyframe so
     // the desktop decoder can initialize without a stall.
