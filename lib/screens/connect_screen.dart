@@ -159,6 +159,9 @@ class _ConnectScreenState extends State<ConnectScreen> {
     final conn = context.read<ConnectionService>();
     final settings = await loadSettings();
     conn.configure(deviceName: settings.deviceName);
+    // Advertise H.264 (hardware) preferred, MJPEG fallback. The desktop selects
+    // h264 only if its build supports decoding it; otherwise we stay on mjpeg.
+    conn.setSupportedVideoCodecs(const ['h264', 'mjpeg']);
     final ok = await conn.connect(host, controlPort, videoPort);
     if (!mounted) return;
     setState(() => _connectingKey = null);

@@ -3,6 +3,7 @@ import 'dart:ui' show Offset;
 import 'package:flutter/foundation.dart';
 import 'package:camera/camera.dart';
 import 'jpeg_encoder.dart';
+import 'h264_encoder_channel.dart';
 
 /// Owns the camera hardware: preview, live frame capture, zoom, flip and torch.
 ///
@@ -21,6 +22,20 @@ class CameraService extends ChangeNotifier {
 
   JpegEncoder _encoder = JpegEncoder();
   bool _encoderReady = false;
+
+  // ── H.264 mode ───────────────────────────────────────────────────────────────
+  // When the desktop negotiates 'h264', frames are sent to the native hardware
+  // encoder instead of the Dart JPEG isolate. The connection layer wires
+  // [onH264Au] to frame each access unit for the wire.
+  final H264EncoderChannel _h264 = H264EncoderChannel();
+  bool _h264Mode = false;
+  bool _h264Started = false;
+  // Target encode size for H.264 (the ladder picks this; default 720p).
+  int _h264Width = 1280;
+  int _h264Height = 720;
+  int _h264Bitrate = 3000000;
+  void Function(H264Au au)? onH264Au;
+  bool get isH264Mode => _h264Mode;
 
   // ── Adaptive quality (Section 6) ─────────────────────────────────────────────
   // Start at a low-latency profile; reportBacklog() nudges it up/down. Bounds per
@@ -136,6 +151,43 @@ class CameraService extends ChangeNotifier {
     };
   }
 
+  /// Enable/disable H.264 hardware-encode mode. When enabling, the native
+  /// encoder is started at the current target size; AUs arrive via [onH264Au].
+  /// When disabling, falls back to the Dart JPEG path.
+  Future<void> setH264Mode(bool enabled, {int? width, int? height, int? bitrate}) async {
+    if (width != null) _h264Width = width;
+    if (height != null) _h264Height = height;
+    if (bitrate != null) _h264Bitrate = bitrate;
+    if (enabled == _h264Mode && _h264Started) return;
+    _h264Mode = enabled;
+    if (enabled) {
+      _h264.onAu = (au) => onH264Au?.call(au);
+      _h264.onError = (r) => debugPrint('[CameraService] h264 error: $r');
+      _h264Started = await _h264.start(
+        width: _h264Width, height: _h264Height,
+        fps: _targetFps, bitrate: _h264Bitrate,
+      );
+      debugPrint('[CameraService] H.264 mode ${_h264Started ? "started" : "FAILED"} '
+          '${_h264Width}x$_h264Height @${_targetFps}fps ${_h264Bitrate}bps');
+    } else {
+      await _h264.stop();
+      _h264Started = false;
+    }
+    notifyListeners();
+  }
+
+  /// Push the latest ABR target into the running H.264 encoder (bitrate is
+  /// applied live; resolution change requires a restart — handled by the ABR
+  /// controller via setH264Mode).
+  Future<void> updateH264Bitrate(int bitrate) async {
+    _h264Bitrate = bitrate;
+    if (_h264Mode && _h264Started) await _h264.setBitrate(bitrate);
+  }
+
+  Future<void> requestH264Keyframe() async {
+    if (_h264Mode && _h264Started) await _h264.requestKeyframe();
+  }
+
   Future<void> startStreaming() async {
     final c = _controller;
     if (c == null || !c.value.isInitialized) return;
@@ -159,13 +211,46 @@ class CameraService extends ChangeNotifier {
     notifyListeners();
   }
 
-  void _onCameraImage(CameraImage image) {
-    if (!_encoderReady || onJpegFrame == null) return;
+  // Monotonic-ish capture clock base (µs) for AU/JPEG timestamps.
+  final int _epochUs = DateTime.now().microsecondsSinceEpoch;
 
-    // FPS throttle.
+  void _onCameraImage(CameraImage image) {
+    // FPS throttle (shared by both codecs).
     final now = DateTime.now();
     final minGapMs = (1000 / _targetFps).round();
     if (now.difference(_lastSent).inMilliseconds < minGapMs) return;
+
+    // ── H.264 path ──────────────────────────────────────────────────────────
+    // Send YUV planes straight to the native hardware encoder. No Dart encode,
+    // no isolate. Network backpressure still applies (skip if the socket can't
+    // take more). The native side handles its own input-buffer backpressure.
+    if (_h264Mode && _h264Started) {
+      if (canSendFrame != null && !canSendFrame!()) return;
+      if (image.format.group != ImageFormatGroup.yuv420 || image.planes.length < 3) return;
+      _lastSent = now;
+      final ptsUs = DateTime.now().microsecondsSinceEpoch - _epochUs;
+      _h264.encodeFrame(
+        y: image.planes[0].bytes,
+        u: image.planes[1].bytes,
+        v: image.planes[2].bytes,
+        yStride: image.planes[0].bytesPerRow,
+        uvStride: image.planes[1].bytesPerRow,
+        uvPixelStride: image.planes[1].bytesPerPixel ?? 1,
+        ptsUs: ptsUs,
+      );
+      _encodedThisWindow++;
+      final nowMs = now.millisecondsSinceEpoch;
+      if (_encodeWindowStartMs == 0) _encodeWindowStartMs = nowMs;
+      if (nowMs - _encodeWindowStartMs >= 1000) {
+        _measuredFps = (_encodedThisWindow * 1000 / (nowMs - _encodeWindowStartMs)).round();
+        _encodedThisWindow = 0;
+        _encodeWindowStartMs = nowMs;
+      }
+      return;
+    }
+
+    // ── Legacy JPEG path ────────────────────────────────────────────────────
+    if (!_encoderReady || onJpegFrame == null) return;
 
     // Backpressure: never queue. If a frame is still encoding, or the network
     // can't take more, drop this one — realtime beats backlog.
@@ -401,6 +486,7 @@ class CameraService extends ChangeNotifier {
   void dispose() {
     _disposeController();
     _encoder.dispose();
+    _h264.stop();
     super.dispose();
   }
 }

@@ -3,6 +3,7 @@ import 'dart:async';
 import 'dart:io';
 import 'dart:convert';
 import 'package:web_socket_channel/web_socket_channel.dart';
+import 'video_protocol.dart';
 
 enum ConnectionStatus { idle, connecting, connected, error, reconnecting }
 enum LinkQuality { excellent, good, fair, poor, disconnected }
@@ -505,6 +506,54 @@ class ConnectionService extends ChangeNotifier {
       _pendingBytes = 0;
       _flushing = false;
       _log('sendFrame failed: $e');
+    }
+  }
+
+  /// Send one H.264 access unit as a v2 wire frame (16-byte header + Annex-B).
+  /// [type] 0=config 1=key 2=delta. Same drop-on-backlog policy as sendFrame.
+  void sendV2Frame({
+    required int type,
+    required Uint8List payload,
+    required int captureTsUs,
+    bool mirror = false,
+    int rotation = 0,
+  }) {
+    final sock = _videoSocket;
+    if (sock == null || !_videoHeaderSent) { _framesDropped++; return; }
+    // Never drop config/key on backlog (they gate decodability); only deltas.
+    if (type == 2 && _pendingBytes >= _maxPendingBytes) { _framesDropped++; return; }
+    try {
+      final out = encodeV2Frame(
+        type: type == 0
+            ? V2FrameType.config
+            : type == 1
+                ? V2FrameType.key
+                : V2FrameType.delta,
+        payload: payload,
+        captureTsUs: captureTsUs,
+        mirror: mirror,
+        rotation: rotation,
+      );
+      sock.add(out);
+      _pendingBytes += out.length;
+      _framesSent++;
+      _accountBitrate(out.length);
+      if (!_flushing) {
+        _flushing = true;
+        sock.flush().then((_) {
+          _pendingBytes = 0;
+          _flushing = false;
+        }).catchError((_) {
+          _pendingBytes = 0;
+          _flushing = false;
+        });
+      }
+      if (_framesSent % 30 == 0) notifyListeners();
+    } catch (e) {
+      _framesDropped++;
+      _pendingBytes = 0;
+      _flushing = false;
+      _log('sendV2Frame failed: $e');
     }
   }
 

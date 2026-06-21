@@ -78,6 +78,24 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
     _camera.onJpegFrame = (jpeg) => _conn?.sendFrame(jpeg);
     _camera.canSendFrame = () => _conn?.canAcceptFrame ?? false;
     _camera.onEncoderRestart = (reason) => _conn?.reportUnsupported('encoder', 'restarted: $reason');
+
+    // H.264: forward each hardware access unit as a v2 wire frame, stamping the
+    // current orientation + front-camera mirror so the desktop bakes them in.
+    _camera.onH264Au = (au) {
+      _conn?.sendV2Frame(
+        type: au.type,
+        payload: au.data,
+        captureTsUs: au.ptsUs,
+        mirror: _camera.lensDirection == CameraLensDirection.front,
+        rotation: _orientation.angle,
+      );
+    };
+    // If the desktop negotiated h264, switch the camera into hardware-encode
+    // mode (default 720p; the ABR controller may raise/lower this later).
+    if (_conn?.videoCodec == 'h264') {
+      await _camera.setH264Mode(true, width: 1280, height: 720, bitrate: 3000000);
+    }
+
     await _camera.startStreaming();
     _camera.addListener(_onCameraChanged);
 
