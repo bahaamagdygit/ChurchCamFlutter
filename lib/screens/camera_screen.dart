@@ -106,14 +106,14 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
     // If the desktop negotiated h264, switch the camera into hardware-encode
     // mode (default 720p; the ABR controller raises/lowers this live).
     if (_conn?.videoCodec == 'h264') {
-      // Start at the top tier (1080p30) for maximum quality on capable devices;
-      // the ABR controller steps down only if the link can't sustain it.
-      await _camera.setH264Mode(true, width: 1920, height: 1080, bitrate: 6000000);
+      // Start at 1080p30 (a safe high-quality default); the ABR controller can
+      // climb to 1080p60 if the WiFi is strong, or step down under congestion.
+      await _camera.setH264Mode(true, width: 1920, height: 1080, fps: 30, bitrate: 6000000);
       _abr = AbrController(
-        startTier: 0, // 1080p30
+        startTier: 1, // 1080p30 in the new ladder
         onTierChange: (t) async {
           // Resolution/fps change → restart the encoder at the new tier.
-          await _camera.setH264Mode(true, width: t.width, height: t.height, bitrate: t.bitrate);
+          await _camera.setH264Mode(true, width: t.width, height: t.height, fps: t.fps, bitrate: t.bitrate);
           await _camera.requestH264Keyframe();
         },
         onBitrate: (br) => _camera.updateH264Bitrate(br),

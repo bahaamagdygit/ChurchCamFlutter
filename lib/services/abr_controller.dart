@@ -11,10 +11,12 @@ class AbrTier {
 }
 
 const List<AbrTier> kAbrLadder = [
-  AbrTier('1080p30', 1920, 1080, 30, 6000000), // T0
-  AbrTier('720p30', 1280, 720, 30, 3000000), //  T1
-  AbrTier('720p24', 1280, 720, 24, 2000000), //  T2
-  AbrTier('540p24', 960, 540, 24, 1200000), //   T3
+  AbrTier('1080p60', 1920, 1080, 60, 8000000), // T0 — smoothest (needs strong WiFi)
+  AbrTier('1080p30', 1920, 1080, 30, 6000000), // T1
+  AbrTier('720p60', 1280, 720, 60, 4500000), //  T2
+  AbrTier('720p30', 1280, 720, 30, 3000000), //  T3
+  AbrTier('720p24', 1280, 720, 24, 2000000), //  T4
+  AbrTier('540p24', 960, 540, 24, 1200000), //   T5
 ];
 
 /// Receive-side stats the desktop reports over the WS (`rx_stats`).

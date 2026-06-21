@@ -176,10 +176,14 @@ class CameraService extends ChangeNotifier {
   /// Enable/disable H.264 hardware-encode mode. The native encoder is started
   /// LAZILY from the first frame's actual width/height (see [_onCameraImage]),
   /// so it always matches the camera. [width]/[height] select the capture preset
-  /// (quality ceiling); [bitrate] sets the encoder target.
-  Future<void> setH264Mode(bool enabled, {int? width, int? height, int? bitrate}) async {
+  /// (quality ceiling); [fps] sets the target frame rate; [bitrate] the encoder
+  /// target.
+  Future<void> setH264Mode(bool enabled, {int? width, int? height, int? fps, int? bitrate}) async {
     if (bitrate != null) _h264TargetBitrate = bitrate;
     _h264Bitrate = _h264TargetBitrate;
+    // A target-fps change is treated like a resolution change (encoder restart).
+    final fpsChanged = fps != null && fps != _targetFps;
+    if (fps != null) _targetFps = fps.clamp(_minFps, 60);
 
     // Pick a capture preset matching the requested tier. For H.264 we WANT a
     // high-res sensor frame (the old 'medium' was only to spare the Dart-JPEG
@@ -198,17 +202,18 @@ class CameraService extends ChangeNotifier {
       }
     }
 
-    if (enabled == _h264Mode && _h264Started && !presetChanged) {
-      // Already running at this resolution — just retune bitrate live.
+    if (enabled == _h264Mode && _h264Started && !presetChanged && !fpsChanged) {
+      // Already running at this resolution/fps — just retune bitrate live.
       if (bitrate != null) await _h264.setBitrate(_h264Bitrate);
       return;
     }
 
-    // Resolution change (ABR tier) on a running encoder: stop it, re-open the
-    // camera at the new capture size, and re-prime from the next frame.
-    if (presetChanged) {
+    // Resolution change (ABR tier) → re-open the camera at the new capture size.
+    // An fps-only change just needs an encoder restart (camera image-stream rate
+    // is best-effort; the encoder's KEY_FRAME_RATE is what we control).
+    if (presetChanged || fpsChanged) {
       if (_h264Started || _h264NeedsStart) { await _h264.stop(); _h264Started = false; }
-      await _startController();
+      if (presetChanged) await _startController();
     }
 
     _h264Mode = enabled;
