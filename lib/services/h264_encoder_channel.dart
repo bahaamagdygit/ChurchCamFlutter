@@ -63,8 +63,15 @@ class H264EncoderChannel {
     }
   }
 
-  /// Push one YUV_420_888 frame to the native encoder.
-  Future<void> encodeFrame({
+  // Only one encode call in flight across the channel at a time. If the native
+  // side is still busy with the previous frame, DROP this one — piling up 1.4MB
+  // MethodChannel calls is the main phone-side lag source.
+  bool _encodeInFlight = false;
+
+  /// Push one YUV_420_888 frame to the native encoder. Fire-and-forget: we do
+  /// NOT await the round-trip (that serialized the whole pipeline). We only track
+  /// completion to gate the next frame.
+  void encodeFrame({
     required Uint8List y,
     required Uint8List u,
     required Uint8List v,
@@ -72,22 +79,22 @@ class H264EncoderChannel {
     required int uvStride,
     required int uvPixelStride,
     required int ptsUs,
-  }) async {
-    if (!_started) return;
-    try {
-      await _ctrl.invokeMethod('encodeFrame', {
-        'y': y,
-        'u': u,
-        'v': v,
-        'yStride': yStride,
-        'uvStride': uvStride,
-        'uvPixelStride': uvPixelStride,
-        'ptsUs': ptsUs,
-      });
-    } catch (e) {
-      // Per-frame errors are non-fatal — drop and continue.
+  }) {
+    if (!_started || _encodeInFlight) return;
+    _encodeInFlight = true;
+    _ctrl.invokeMethod('encodeFrame', {
+      'y': y,
+      'u': u,
+      'v': v,
+      'yStride': yStride,
+      'uvStride': uvStride,
+      'uvPixelStride': uvPixelStride,
+      'ptsUs': ptsUs,
+    }).catchError((e) {
       debugPrint('[H264EncoderChannel] encodeFrame error: $e');
-    }
+    }).whenComplete(() {
+      _encodeInFlight = false;
+    });
   }
 
   Future<void> setBitrate(int bitrate) async {

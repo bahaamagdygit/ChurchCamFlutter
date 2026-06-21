@@ -58,14 +58,22 @@ class H264Encoder(
             format.setInteger(MediaFormat.KEY_COLOR_FORMAT, colorFormat)
             format.setInteger(MediaFormat.KEY_BIT_RATE, bitrate)
             format.setInteger(MediaFormat.KEY_FRAME_RATE, fps)
-            format.setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1) // keyframe every 1s
+            // Keyframe every 2s. Frequent IDRs eat the bitrate budget and starve
+            // P-frames → blocky/blurry motion. 2s + on-demand resync is plenty.
+            format.setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 2)
+            // CBR keeps a STEADY bitrate so motion scenes don't spike past the
+            // link capacity (the spike was the visible blur/stutter on motion).
             format.setInteger(MediaFormat.KEY_BITRATE_MODE,
-                MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_VBR)
-            // Baseline keeps decode simple & latency low on the desktop side.
+                MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_CBR)
+            // Baseline: no B-frames, simplest decode, lowest latency.
             format.setInteger(MediaFormat.KEY_PROFILE,
                 MediaCodecInfo.CodecProfileLevel.AVCProfileBaseline)
+            format.setInteger(MediaFormat.KEY_LEVEL,
+                MediaCodecInfo.CodecProfileLevel.AVCLevel41)
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
                 format.setInteger(MediaFormat.KEY_LATENCY, 1)
+                // Cap the encoder's internal queue so it can't build a backlog.
+                format.setInteger(MediaFormat.KEY_MAX_B_FRAMES, 0)
             }
 
             val c = MediaCodec.createEncoderByType(mime)
@@ -75,7 +83,7 @@ class H264Encoder(
             running.set(true)
             frameIndex = 0
             convertBuf = ByteArray(width * height * 3 / 2)
-            Log.i(TAG, "encoder started ${width}x$height @${fps}fps ${bitrate}bps colorFmt=$colorFormat")
+            Log.i(TAG, "[H264] STARTED ${width}x$height @${fps}fps ${bitrate / 1000}kbps CBR colorFmt=$colorFormat")
         } catch (e: Exception) {
             Log.e(TAG, "start failed: ${e.message}")
             onError("encoder start: ${e.message}")
@@ -109,8 +117,15 @@ class H264Encoder(
 
     /**
      * Encode one YUV_420_888 frame. Planes arrive as separate byte arrays with
-     * strides (matching CameraImage). We pack to the encoder's color format,
-     * queue the input buffer, then drain any output AUs.
+     * the SOURCE strides (from Flutter's CameraImage). We copy into the encoder's
+     * own input Image, honoring the ENCODER's destination strides — this is the
+     * key fix for the diagonal-shear / blur distortion: the encoder's input
+     * buffer is usually stride-padded, and blindly packing tight width×height
+     * bytes corrupts every row. getInputImage() exposes the real strides.
+     *
+     * Non-blocking: dequeueInputBuffer with a 0 timeout. If no input buffer is
+     * free the frame is DROPPED (returns) rather than blocking the caller —
+     * realtime beats backlog.
      */
     @Synchronized
     fun encodeFrame(
@@ -121,18 +136,87 @@ class H264Encoder(
         val c = codec ?: return
         if (!running.get()) return
         try {
-            val inIndex = c.dequeueInputBuffer(TIMEOUT_US)
+            val inIndex = c.dequeueInputBuffer(0)  // 0 = don't block; drop if busy
             if (inIndex >= 0) {
-                val input = c.getInputBuffer(inIndex) ?: return
-                input.clear()
-                val packed = packYuv(y, u, v, yStride, uvStride, uvPixelStride)
-                input.put(packed, 0, width * height * 3 / 2)
-                c.queueInputBuffer(inIndex, 0, width * height * 3 / 2, ptsUs, 0)
+                val img = try { c.getInputImage(inIndex) } catch (_: Throwable) { null }
+                if (img != null) {
+                    copyToEncoderImage(img, y, u, v, yStride, uvStride, uvPixelStride)
+                    c.queueInputBuffer(inIndex, 0, width * height * 3 / 2, ptsUs, 0)
+                } else {
+                    // Fallback (rare): semi-planar pack into the raw ByteBuffer.
+                    val input = c.getInputBuffer(inIndex)
+                    if (input != null) {
+                        input.clear()
+                        val packed = packYuv(y, u, v, yStride, uvStride, uvPixelStride)
+                        input.put(packed, 0, width * height * 3 / 2)
+                        c.queueInputBuffer(inIndex, 0, width * height * 3 / 2, ptsUs, 0)
+                    } else {
+                        c.queueInputBuffer(inIndex, 0, 0, ptsUs, 0)
+                    }
+                }
             }
             drainOutput(c)
         } catch (e: Exception) {
             Log.e(TAG, "encodeFrame failed: ${e.message}")
             onError("encode: ${e.message}")
+        }
+    }
+
+    /**
+     * Copy source YUV_420_888 planes into the encoder's input Image, honoring
+     * BOTH the source strides (from CameraImage) and the destination strides
+     * (from the encoder). Handles planar (I420) and semi-planar (NV12/NV21)
+     * destinations by following each destination plane's pixelStride.
+     */
+    private fun copyToEncoderImage(
+        img: android.media.Image,
+        y: ByteArray, u: ByteArray, v: ByteArray,
+        srcYStride: Int, srcUvStride: Int, srcUvPixelStride: Int,
+    ) {
+        val w = width; val h = height
+        val planes = img.planes
+
+        // ── Y plane ──
+        run {
+            val dst = planes[0].buffer
+            val dStride = planes[0].rowStride
+            val rowTmp = ByteArray(w)
+            for (row in 0 until h) {
+                val s = row * srcYStride
+                if (s + w <= y.size) {
+                    System.arraycopy(y, s, rowTmp, 0, w)
+                } else {
+                    java.util.Arrays.fill(rowTmp, 0)
+                }
+                dst.position(row * dStride)
+                dst.put(rowTmp, 0, w)
+            }
+        }
+
+        // ── U / V planes (half resolution) ──
+        val cw = w / 2; val ch = h / 2
+        val uDst = planes[1].buffer
+        val vDst = planes[2].buffer
+        val uStride = planes[1].rowStride
+        val vStride = planes[2].rowStride
+        val uPix = planes[1].pixelStride   // 2 = semi-planar (NV12/NV21), 1 = planar
+        val vPix = planes[2].pixelStride
+        for (row in 0 until ch) {
+            val sU = row * srcUvStride
+            val sV = row * srcUvStride
+            var dU = row * uStride
+            var dV = row * vStride
+            var col = 0
+            while (col < cw) {
+                val sIdx = col * srcUvPixelStride
+                val up = if (sU + sIdx < u.size) u[sU + sIdx] else 0
+                val vp = if (sV + sIdx < v.size) v[sV + sIdx] else 0
+                if (dU < uDst.limit()) { uDst.position(dU); uDst.put(up) }
+                if (dV < vDst.limit()) { vDst.position(dV); vDst.put(vp) }
+                dU += uPix
+                dV += vPix
+                col++
+            }
         }
     }
 
@@ -152,6 +236,8 @@ class H264Encoder(
                     (info.flags and MediaCodec.BUFFER_FLAG_KEY_FRAME) != 0 -> TYPE_KEY
                     else -> TYPE_DELTA
                 }
+                if (type == TYPE_CONFIG) Log.i(TAG, "[H264] SPS/PPS config emitted (${bytes.size}B)")
+                else if (type == TYPE_KEY) Log.i(TAG, "[H264] KEYFRAME emitted (${bytes.size}B)")
                 onEncoded(type, bytes, info.presentationTimeUs)
             }
             c.releaseOutputBuffer(outIndex, false)
