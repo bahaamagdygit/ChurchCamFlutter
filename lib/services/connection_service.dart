@@ -79,6 +79,20 @@ class ConnectionService extends ChangeNotifier {
   // Current phone orientation angle (0/90/180/270) sent on hello + on change.
   int _orientationAngle = 0;
 
+  // Video codecs this build can SEND, best-first. Phase 0 advertises 'mjpeg'
+  // only; when the native H.264 encoder lands this becomes ['h264','mjpeg'] and
+  // the desktop auto-selects h264 if it can decode. The negotiated result from
+  // the welcome message is stored in [_videoCodec].
+  List<String> _supportedVideoCodecs = const ['mjpeg'];
+  String _videoCodec = 'mjpeg';
+  String get videoCodec => _videoCodec;
+
+  /// Override the advertised codec list (e.g. enable 'h264' once the native
+  /// encoder is wired up). Best-first order.
+  void setSupportedVideoCodecs(List<String> codecs) {
+    if (codecs.isNotEmpty) _supportedVideoCodecs = List.of(codecs);
+  }
+
   // Reading text overlay pushed from the desktop.
   String _readingText = '';
   List<String> _readingLangs = const [];
@@ -251,6 +265,7 @@ class ConnectionService extends ChangeNotifier {
         'platform': 'Android',
         'capabilities': _capabilities,
         'orientationAngle': _orientationAngle,
+        'videoCodecs': _supportedVideoCodecs,
       };
       try {
         final extra = stateProvider?.call();
@@ -284,6 +299,9 @@ class ConnectionService extends ChangeNotifier {
       case 'welcome':
         _deviceId = (msg['deviceId'] ?? '').toString();
         if (msg['videoPort'] is int) _videoPort = msg['videoPort'] as int;
+        // Codec the desktop selected for this session (defaults to mjpeg for
+        // older desktops that don't send the field).
+        _videoCodec = (msg['videoCodec'] ?? 'mjpeg').toString();
         // Optional desktop state in the welcome (Section 3).
         if (msg['streamStatus'] != null) _streamLive = msg['streamStatus'] == 'live';
         if (msg['recordingStatus'] != null) _recording = msg['recordingStatus'] == 'recording';
@@ -422,6 +440,25 @@ class ConnectionService extends ChangeNotifier {
   /// Current un-flushed video bytes — used by the adaptive-quality controller.
   int get pendingVideoBytes => _pendingBytes;
 
+  // ── Send-bitrate metric (rolling 1s window) ──────────────────────────────────
+  int _bitrateWindowBytes = 0;
+  int _bitrateWindowStartMs = 0;
+  int _sendBitrateKbps = 0;
+  /// Measured outgoing video bitrate in kbps (rolling ~1s). For the metrics HUD.
+  int get sendBitrateKbps => _sendBitrateKbps;
+
+  void _accountBitrate(int bytes) {
+    final now = DateTime.now().millisecondsSinceEpoch;
+    if (_bitrateWindowStartMs == 0) _bitrateWindowStartMs = now;
+    _bitrateWindowBytes += bytes;
+    final elapsed = now - _bitrateWindowStartMs;
+    if (elapsed >= 1000) {
+      _sendBitrateKbps = ((_bitrateWindowBytes * 8) / elapsed).round(); // bits/ms == kbits/s
+      _bitrateWindowBytes = 0;
+      _bitrateWindowStartMs = now;
+    }
+  }
+
   /// Send one JPEG video frame: 4-byte big-endian length prefix + JPEG bytes.
   /// Frames are dropped (counted) when the channel isn't ready or backlogged.
   void sendFrame(Uint8List jpeg) {
@@ -448,6 +485,7 @@ class ConnectionService extends ChangeNotifier {
       sock.add(out);
       _pendingBytes += out.length;
       _framesSent++;
+      _accountBitrate(out.length);
 
       // Flush and clear the pending counter when the OS has taken the data.
       if (!_flushing) {

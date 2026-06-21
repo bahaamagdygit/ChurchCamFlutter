@@ -51,6 +51,16 @@ class CameraService extends ChangeNotifier {
   int get targetFps => _targetFps;
   int get jpegQuality => _jpegQuality;
 
+  // ── Metrics (Phase 0 HUD) ────────────────────────────────────────────────────
+  // Rolling average encode time (ms) and measured capture/encode FPS. Fields
+  // only — no behavior change. Surfaced to the metrics overlay.
+  double _avgEncodeMs = 0;
+  int _encodedThisWindow = 0;
+  int _encodeWindowStartMs = 0;
+  int _measuredFps = 0;
+  double get avgEncodeMs => _avgEncodeMs;
+  int get measuredFps => _measuredFps;
+
   // ── Getters ────────────────────────────────────────────────────────────────
   CameraController? get controller => _controller;
   bool get isInitialized => _controller?.value.isInitialized ?? false;
@@ -168,7 +178,19 @@ class CameraService extends ChangeNotifier {
     final raw = _packFrame(image);
     if (raw == null) { _frameInFlight = false; return; }
 
+    final encodeStart = DateTime.now();
     _encoder.encode(raw).then((jpeg) {
+      // Rolling encode-time average + measured FPS (metrics only).
+      final ms = DateTime.now().difference(encodeStart).inMilliseconds.toDouble();
+      _avgEncodeMs = _avgEncodeMs == 0 ? ms : (_avgEncodeMs * 0.8 + ms * 0.2);
+      final nowMs = DateTime.now().millisecondsSinceEpoch;
+      if (_encodeWindowStartMs == 0) _encodeWindowStartMs = nowMs;
+      _encodedThisWindow++;
+      if (nowMs - _encodeWindowStartMs >= 1000) {
+        _measuredFps = (_encodedThisWindow * 1000 / (nowMs - _encodeWindowStartMs)).round();
+        _encodedThisWindow = 0;
+        _encodeWindowStartMs = nowMs;
+      }
       if (jpeg != null && _streaming) {
         try { onJpegFrame?.call(jpeg); } catch (_) {}
       } else if (jpeg == null) {
