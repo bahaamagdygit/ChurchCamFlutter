@@ -53,6 +53,10 @@ class CameraService extends ChangeNotifier {
   double _minZoom = 1.0;
   double _maxZoom = 1.0;
   bool _torchOn = false;
+  // AE/AF lock state — when locked the camera holds the current focus/exposure
+  // instead of continuously hunting (important for a fixed church shot).
+  bool _focusLocked = false;
+  bool _exposureLocked = false;
   // Capture at a MODEST sensor resolution so the YUV buffer we iterate is small.
   // A huge sensor frame is the main cause of per-frame CPU lag; medium keeps the
   // source ~720x480-class and the in-read downscale does the rest.
@@ -92,6 +96,8 @@ class CameraService extends ChangeNotifier {
   double get maxZoom => _maxZoom;
   bool get torchOn => _torchOn;
   bool get hasTorch => _currentLensIsBack;
+  bool get focusLocked => _focusLocked;
+  bool get exposureLocked => _exposureLocked;
   CameraLensDirection get lensDirection =>
       _cameras.isNotEmpty ? _cameras[_cameraIndex].lensDirection : CameraLensDirection.back;
   bool get _currentLensIsBack => lensDirection == CameraLensDirection.back;
@@ -128,8 +134,11 @@ class CameraService extends ChangeNotifier {
     await controller.initialize();
 
     // Lock exposure/focus modes to "continuous" for a stable, sharp picture.
+    // A fresh controller always starts unlocked.
     try { await controller.setFocusMode(FocusMode.auto); } catch (_) {}
     try { await controller.setExposureMode(ExposureMode.auto); } catch (_) {}
+    _focusLocked = false;
+    _exposureLocked = false;
 
     _minZoom = await controller.getMinZoomLevel();
     _maxZoom = await controller.getMaxZoomLevel();
@@ -470,6 +479,36 @@ class CameraService extends ChangeNotifier {
     try {
       await c.setFocusPoint(p);
       await c.setExposurePoint(p);
+      return true;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  /// Lock/unlock continuous autofocus. When locked the lens holds its current
+  /// focus distance (FocusMode.locked); unlocked resumes FocusMode.auto.
+  Future<bool> setFocusLocked(bool locked) async {
+    final c = _controller;
+    if (c == null || !c.value.isInitialized) return false;
+    try {
+      await c.setFocusMode(locked ? FocusMode.locked : FocusMode.auto);
+      _focusLocked = locked;
+      notifyListeners();
+      return true;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  /// Lock/unlock auto-exposure. Locked holds the current exposure
+  /// (ExposureMode.locked); unlocked resumes ExposureMode.auto.
+  Future<bool> setExposureLocked(bool locked) async {
+    final c = _controller;
+    if (c == null || !c.value.isInitialized) return false;
+    try {
+      await c.setExposureMode(locked ? ExposureMode.locked : ExposureMode.auto);
+      _exposureLocked = locked;
+      notifyListeners();
       return true;
     } catch (_) {
       return false;

@@ -2,19 +2,21 @@ import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 import '../services/connection_service.dart';
 import '../services/camera_service.dart';
+import '../services/device_status_service.dart';
 
 /// Compact live metrics HUD for professional monitoring: latency, FPS, bitrate,
-/// dropped frames, codec/quality and link grade. Rebuilds on connection +
-/// camera changes (both are ChangeNotifiers).
+/// dropped frames, codec/quality, link grade, battery and WiFi signal. Rebuilds
+/// on connection + camera + device-status changes (all ChangeNotifiers).
 class MetricsOverlay extends StatelessWidget {
-  const MetricsOverlay({super.key, required this.camera});
+  const MetricsOverlay({super.key, required this.camera, required this.status});
 
   final CameraService camera;
+  final DeviceStatusService status;
 
   @override
   Widget build(BuildContext context) {
     return AnimatedBuilder(
-      animation: camera,
+      animation: Listenable.merge([camera, status]),
       builder: (_, __) => Consumer<ConnectionService>(
         builder: (_, conn, ___) {
           final q = conn.quality;
@@ -38,12 +40,35 @@ class MetricsOverlay extends StatelessWidget {
                     conn.framesDropped > 0 ? const Color(0xFFF59E0B) : Colors.white),
                 _row('QUALITY', camera.qualityLabel, Colors.white),
                 _row('LINK', _qualityName(q), color),
+                _row('WIFI', _wifiText(status), _wifiColor(status.wifiBars)),
+                _row('BATTERY', _batteryText(status), _batteryColor(status)),
               ],
             ),
           );
         },
       ),
     );
+  }
+
+  static String _wifiText(DeviceStatusService s) =>
+      s.wifiRssi <= -127 ? '—' : '${'▮' * s.wifiBars}${'▯' * (4 - s.wifiBars)}  ${s.wifiRssi}dBm';
+
+  static Color _wifiColor(int bars) {
+    if (bars >= 4) return const Color(0xFF22C55E);
+    if (bars >= 3) return const Color(0xFF84CC16);
+    if (bars >= 2) return const Color(0xFFF59E0B);
+    return const Color(0xFFEF4444);
+  }
+
+  static String _batteryText(DeviceStatusService s) =>
+      s.batteryPercent < 0 ? '—' : '${s.batteryPercent}%${s.charging ? ' ⚡' : ''}';
+
+  static Color _batteryColor(DeviceStatusService s) {
+    if (s.charging) return const Color(0xFF22C55E);
+    if (s.batteryPercent < 0) return Colors.white;
+    if (s.batteryPercent <= 15) return const Color(0xFFEF4444);
+    if (s.batteryPercent <= 30) return const Color(0xFFF59E0B);
+    return Colors.white;
   }
 
   Widget _row(String k, String v, Color vColor) => Padding(

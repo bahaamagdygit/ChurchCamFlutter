@@ -32,6 +32,9 @@ dependencies:
   # Accelerometer-based device orientation
   sensors_plus: ^6.0.1
 
+  # Battery level for the metrics HUD / desktop device list
+  battery_plus: ^6.0.0
+
   # Networking
   web_socket_channel: ^2.4.0
 

@@ -1,5 +1,7 @@
 package com.churchcam.flutter
 
+import android.content.Context
+import android.net.wifi.WifiManager
 import androidx.annotation.NonNull
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
@@ -34,6 +36,27 @@ class MainActivity : FlutterActivity() {
                 }
             }
         )
+
+        // Device info channel — WiFi signal strength (RSSI → 0..4 bars + dBm).
+        MethodChannel(messenger, "churchcam/device").setMethodCallHandler { call, result ->
+            when (call.method) {
+                "wifiSignal" -> {
+                    try {
+                        val wm = applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
+                        @Suppress("DEPRECATION")
+                        val info = wm.connectionInfo
+                        val rssi = info?.rssi ?: -127
+                        // Android's standard 0..4 bar mapping.
+                        @Suppress("DEPRECATION")
+                        val bars = WifiManager.calculateSignalLevel(rssi, 5)
+                        result.success(mapOf("rssi" to rssi, "bars" to bars))
+                    } catch (e: Exception) {
+                        result.success(mapOf("rssi" to -127, "bars" to 0))
+                    }
+                }
+                else -> result.notImplemented()
+            }
+        }
 
         MethodChannel(messenger, "churchcam/h264").setMethodCallHandler { call, result ->
             when (call.method) {

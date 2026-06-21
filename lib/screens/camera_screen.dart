@@ -6,6 +6,7 @@ import 'package:wakelock_plus/wakelock_plus.dart';
 import '../services/connection_service.dart';
 import '../services/camera_service.dart';
 import '../services/abr_controller.dart';
+import '../services/device_status_service.dart';
 import '../services/orientation_service.dart';
 import '../services/storage.dart';
 import '../models/camera_filters.dart';
@@ -27,6 +28,8 @@ class CameraScreen extends StatefulWidget {
 class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver {
   final CameraService _camera = CameraService();
   final OrientationService _orientation = OrientationService();
+  final DeviceStatusService _deviceStatus = DeviceStatusService();
+  Timer? _statusTimer;
 
   bool _permissionDenied = false;
   bool _initializing = true;
@@ -58,6 +61,12 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
     _conn!.stateProvider = _buildStateRestore;
     _orientation.addListener(_onOrientation);
     _orientation.start();
+    _deviceStatus.start();
+    // Push battery + wifi to the desktop every 5s (and refresh the HUD).
+    _deviceStatus.addListener(() { if (mounted) setState(() {}); });
+    _statusTimer = Timer.periodic(const Duration(seconds: 5), (_) {
+      _conn?.sendDeviceStatus(_deviceStatus.toJson());
+    });
     _bootstrap();
   }
 
@@ -183,6 +192,20 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
           conn?.confirmControl('exposure', applied);
         }
         break;
+      case 'focus_lock':
+        {
+          final lock = cmd.value == true || cmd.value == 'on' || cmd.value == 'lock';
+          final ok = await _camera.setFocusLocked(lock);
+          conn?.confirmControl('focus_lock', ok ? (lock ? 'locked' : 'auto') : 'unsupported');
+        }
+        break;
+      case 'exposure_lock':
+        {
+          final lock = cmd.value == true || cmd.value == 'on' || cmd.value == 'lock';
+          final ok = await _camera.setExposureLocked(lock);
+          conn?.confirmControl('exposure_lock', ok ? (lock ? 'locked' : 'auto') : 'unsupported');
+        }
+        break;
       case 'white_balance':
         if (_camera.whiteBalanceSupported) {
           conn?.confirmControl('white_balance', cmd.value);
@@ -272,7 +295,9 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
     WidgetsBinding.instance.removeObserver(this);
     WakelockPlus.disable();
     _adaptiveTimer?.cancel();
+    _statusTimer?.cancel();
     _focusTimer?.cancel();
+    _deviceStatus.dispose();
     _abr?.dispose();
     _conn?.removeCommandListener(_onRemoteCommand);
     _conn?.stateProvider = null;
@@ -328,10 +353,18 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
 
           // Metrics HUD (top-left, under the badge)
           if (_showMetrics)
-            Positioned(top: 84, left: 16, child: MetricsOverlay(camera: _camera)),
+            Positioned(top: 84, left: 16, child: MetricsOverlay(camera: _camera, status: _deviceStatus)),
 
           // Torch + flip quick toggles (top-right)
           Positioned(top: 40, right: 12, child: Row(children: [
+            // AF-L: hold focus
+            _labelToggle('AF-L', _camera.focusLocked,
+                () => _camera.setFocusLocked(!_camera.focusLocked)),
+            const SizedBox(width: 8),
+            // AE-L: hold exposure
+            _labelToggle('AE-L', _camera.exposureLocked,
+                () => _camera.setExposureLocked(!_camera.exposureLocked)),
+            const SizedBox(width: 8),
             _circle(_camera.torchOn ? Icons.flash_on : Icons.flash_off,
                 _camera.hasTorch ? () => _camera.toggleTorch() : null),
             const SizedBox(width: 8),
@@ -444,6 +477,26 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
           width: 42, height: 42,
           decoration: const BoxDecoration(color: Color(0xBF141423), shape: BoxShape.circle),
           child: Icon(icon, color: onTap == null ? Colors.white30 : Colors.white, size: 20),
+        ),
+      );
+
+  /// Pill toggle (e.g. AF-L / AE-L). Amber when active to read as "locked".
+  Widget _labelToggle(String label, bool active, VoidCallback onTap) => GestureDetector(
+        onTap: onTap,
+        child: Container(
+          height: 42,
+          padding: const EdgeInsets.symmetric(horizontal: 12),
+          decoration: BoxDecoration(
+            color: active ? const Color(0xCCF59E0B) : const Color(0xBF141423),
+            borderRadius: BorderRadius.circular(21),
+            border: Border.all(
+                color: active ? const Color(0xFFF59E0B) : Colors.transparent, width: 1.5),
+          ),
+          alignment: Alignment.center,
+          child: Text(label,
+              style: TextStyle(
+                  color: active ? Colors.black : Colors.white,
+                  fontSize: 12, fontWeight: FontWeight.w800, letterSpacing: 0.5)),
         ),
       );
 

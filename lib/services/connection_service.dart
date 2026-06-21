@@ -615,6 +615,11 @@ class ConnectionService extends ChangeNotifier {
     _send({'type': 'orientation_change', 'angle': angle});
   }
 
+  /// Phone → desktop device status (battery, wifi signal) for the device list.
+  void sendDeviceStatus(Map<String, dynamic> status) {
+    _send({'type': 'device_status', 'value': status});
+  }
+
   /// Phone → desktop remote control (e.g. switch desktop camera, next slide).
   void sendControl(String action, [dynamic value]) {
     _send({'type': 'control', 'action': action, 'value': value});
