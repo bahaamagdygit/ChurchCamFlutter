@@ -42,7 +42,6 @@ class H264Encoder(
 
     // Reusable scratch buffer for the converted YUV (resized on configure).
     private var convertBuf: ByteArray = ByteArray(0)
-    private var loggedLayout = false  // one-time encoder-input-layout diagnostic
 
     @Synchronized
     fun start(width: Int, height: Int, fps: Int, bitrate: Int) {
@@ -56,6 +55,11 @@ class H264Encoder(
             // Choose a color format the device's encoder supports. Most support
             // COLOR_FormatYUV420Flexible (maps to NV12/I420 internally).
             colorFormat = pickColorFormat(mime)
+            // COLOR_FormatYUV420SemiPlanar is interleaved chroma. Most device
+            // encoders treat it as NV12 (U,V), but several Qualcomm/MediaTek ones
+            // actually consume NV21 (V,U) — that mismatch was the green corruption.
+            // Flexible maps to NV12 most reliably. Default NV21 for SemiPlanar.
+            semiPlanarVU = colorFormat == MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420SemiPlanar
             format.setInteger(MediaFormat.KEY_COLOR_FORMAT, colorFormat)
             format.setInteger(MediaFormat.KEY_BIT_RATE, bitrate)
             format.setInteger(MediaFormat.KEY_FRAME_RATE, fps)
@@ -83,9 +87,9 @@ class H264Encoder(
             codec = c
             running.set(true)
             frameIndex = 0
-            loggedLayout = false
             convertBuf = ByteArray(width * height * 3 / 2)
-            Log.i(TAG, "[H264] STARTED ${width}x$height @${fps}fps ${bitrate / 1000}kbps CBR colorFmt=$colorFormat")
+            Log.i(TAG, "[H264] STARTED ${width}x$height @${fps}fps ${bitrate / 1000}kbps CBR " +
+                "colorFmt=$colorFormat chroma=${if (semiPlanarVU) "NV21(V,U)" else "NV12(U,V)"}")
         } catch (e: Exception) {
             Log.e(TAG, "start failed: ${e.message}")
             onError("encoder start: ${e.message}")
@@ -140,140 +144,25 @@ class H264Encoder(
         try {
             val inIndex = c.dequeueInputBuffer(0)  // 0 = don't block; drop if busy
             if (inIndex >= 0) {
-                val img = try { c.getInputImage(inIndex) } catch (_: Throwable) { null }
-                if (img != null) {
-                    copyToEncoderImage(img, y, u, v, yStride, uvStride, uvPixelStride)
+                // Direct ByteBuffer path: pack a TIGHT (unpadded) NV12/NV21 buffer
+                // of exactly width*height*3/2 bytes and pass that exact size to
+                // queueInputBuffer. This is the proven path that produced a visible
+                // image; getInputImage() was fragile across devices and broke frame
+                // production. The semiPlanarVU flag fixes the U/V order (green).
+                val input = c.getInputBuffer(inIndex)
+                if (input != null) {
+                    input.clear()
+                    val packed = packYuv(y, u, v, yStride, uvStride, uvPixelStride)
+                    input.put(packed, 0, width * height * 3 / 2)
                     c.queueInputBuffer(inIndex, 0, width * height * 3 / 2, ptsUs, 0)
                 } else {
-                    // Fallback (rare): semi-planar pack into the raw ByteBuffer.
-                    val input = c.getInputBuffer(inIndex)
-                    if (input != null) {
-                        input.clear()
-                        val packed = packYuv(y, u, v, yStride, uvStride, uvPixelStride)
-                        input.put(packed, 0, width * height * 3 / 2)
-                        c.queueInputBuffer(inIndex, 0, width * height * 3 / 2, ptsUs, 0)
-                    } else {
-                        c.queueInputBuffer(inIndex, 0, 0, ptsUs, 0)
-                    }
+                    c.queueInputBuffer(inIndex, 0, 0, ptsUs, 0)
                 }
             }
             drainOutput(c)
         } catch (e: Exception) {
             Log.e(TAG, "encodeFrame failed: ${e.message}")
             onError("encode: ${e.message}")
-        }
-    }
-
-    /**
-     * Copy source YUV_420_888 planes into the encoder's input Image, honoring
-     * BOTH the source strides (from CameraImage) and the destination strides
-     * (from the encoder).
-     *
-     * CRITICAL: the encoder's input Image may be PLANAR (I420 — U and V in
-     * SEPARATE buffers, pixelStride 1) or SEMI-PLANAR (NV12/NV21 — U and V
-     * INTERLEAVED in the SAME buffer, pixelStride 2). The previous code treated
-     * U/V as independent buffers and called position() on each; for the
-     * semi-planar case those are the same buffer, so the writes collided and
-     * scrambled chroma → the green macroblock corruption. We branch explicitly.
-     *
-     * Each destination plane buffer is positioned relative to its own base — we
-     * read each byte through its absolute index, never assuming a shared base.
-     */
-    private fun copyToEncoderImage(
-        img: android.media.Image,
-        y: ByteArray, u: ByteArray, v: ByteArray,
-        srcYStride: Int, srcUvStride: Int, srcUvPixelStride: Int,
-    ) {
-        val w = width; val h = height
-        val planes = img.planes
-
-        // One-time layout log so we can confirm the device's encoder input format.
-        if (!loggedLayout) {
-            loggedLayout = true
-            val uB = planes[1].buffer.position()
-            val vB = planes[2].buffer.position()
-            Log.i(TAG, "[H264] enc input layout: Yrs=${planes[0].rowStride} " +
-                "Urs=${planes[1].rowStride} Ups=${planes[1].pixelStride} " +
-                "Vrs=${planes[2].rowStride} Vps=${planes[2].pixelStride} " +
-                "Ubase=$uB Vbase=$vB (${if (planes[1].pixelStride == 2) (if (vB >= uB) "NV12" else "NV21") else "I420"})")
-        }
-
-        // ── Y plane (always planar) ──
-        run {
-            val dst = planes[0].buffer
-            val dStride = planes[0].rowStride
-            val base = dst.position()
-            val rowTmp = ByteArray(w)
-            for (row in 0 until h) {
-                val s = row * srcYStride
-                if (s + w <= y.size) System.arraycopy(y, s, rowTmp, 0, w)
-                else java.util.Arrays.fill(rowTmp, 0)
-                dst.position(base + row * dStride)
-                dst.put(rowTmp, 0, w)
-            }
-        }
-
-        val cw = w / 2; val ch = h / 2
-        val uPlane = planes[1]
-        val vPlane = planes[2]
-        val uPix = uPlane.pixelStride
-        val uStride = uPlane.rowStride
-        val vStride = vPlane.rowStride
-
-        if (uPix == 2) {
-            // ── SEMI-PLANAR destination (NV12 or NV21) ──
-            // U and V share one buffer; pixelStride 2. Determine the order from
-            // the V plane's base offset relative to U: V before U by 1 byte =>
-            // the buffer is NV21 (V,U); else NV12 (U,V). We write a packed row
-            // then blit it, honoring the destination rowStride.
-            val uDst = uPlane.buffer
-            val vDst = vPlane.buffer
-            val uBase = uDst.position()
-            val vBase = vDst.position()
-            // Most Android encoders expose NV12 here (U first). We honor whichever
-            // plane sits first by writing each sample to its own plane buffer at
-            // its own stride — that is always correct regardless of NV12/NV21.
-            val uRow = ByteArray(cw * 2)
-            val vRowOffset = vBase - uBase  // +1 (NV12) or -1 (NV21)
-            for (row in 0 until ch) {
-                val srcRow = row * srcUvStride
-                // Build the interleaved chroma row into uRow using the real layout.
-                var k = 0
-                var col = 0
-                while (col < cw) {
-                    val sIdx = srcRow + col * srcUvPixelStride
-                    val up = if (sIdx < u.size) u[sIdx] else 0
-                    val vp = if (sIdx < v.size) v[sIdx] else 0
-                    if (vRowOffset >= 0) { uRow[k] = up; uRow[k + 1] = vp }   // NV12: U,V
-                    else                 { uRow[k] = vp; uRow[k + 1] = up }   // NV21: V,U
-                    k += 2
-                    col++
-                }
-                // Blit into the shared buffer at this chroma row.
-                val rowBase = (if (vRowOffset >= 0) uBase else vBase) + row * uStride
-                uDst.position(rowBase)
-                uDst.put(uRow, 0, minOf(uRow.size, uDst.limit() - rowBase))
-            }
-        } else {
-            // ── PLANAR destination (I420) — U and V in separate buffers ──
-            val uDst = uPlane.buffer
-            val vDst = vPlane.buffer
-            val uBase = uDst.position()
-            val vBase = vDst.position()
-            val uRow = ByteArray(cw)
-            val vRow = ByteArray(cw)
-            for (row in 0 until ch) {
-                val srcRow = row * srcUvStride
-                var col = 0
-                while (col < cw) {
-                    val sIdx = srcRow + col * srcUvPixelStride
-                    uRow[col] = if (sIdx < u.size) u[sIdx] else 0
-                    vRow[col] = if (sIdx < v.size) v[sIdx] else 0
-                    col++
-                }
-                uDst.position(uBase + row * uStride); uDst.put(uRow, 0, cw)
-                vDst.position(vBase + row * vStride); vDst.put(vRow, 0, cw)
-            }
         }
     }
 
@@ -302,10 +191,15 @@ class H264Encoder(
     }
 
     /**
-     * Convert YUV_420_888 planes → the encoder's planar/semi-planar layout.
-     * COLOR_FormatYUV420Flexible accepts NV12 (Y plane + interleaved UV). We
-     * write NV12: full Y, then interleaved V/U? No — NV12 is U then V. We honor
-     * the source pixel/row strides while packing tightly to width×height.
+     * Convert YUV_420_888 source planes → a TIGHT (unpadded) semi-planar buffer
+     * of exactly width*height*3/2 bytes: full Y plane, then interleaved chroma.
+     *
+     * Chroma order is controlled by [semiPlanarVU]:
+     *   false → NV12 (U,V)   true → NV21 (V,U)
+     * Writing the wrong order is exactly what produced the GREEN macroblock
+     * corruption (luma right, chroma swapped). We pick the order from the chosen
+     * encoder color format in start(); NV21 is the common correct choice for
+     * COLOR_FormatYUV420SemiPlanar on the typical Qualcomm/MediaTek encoders.
      */
     private fun packYuv(
         y: ByteArray, u: ByteArray, v: ByteArray,
@@ -313,30 +207,35 @@ class H264Encoder(
     ): ByteArray {
         val out = convertBuf
         val w = width; val h = height
-        // Y plane — copy row by row honoring stride.
+        // Y plane — copy row by row honoring the SOURCE stride (strip padding).
         var o = 0
         for (row in 0 until h) {
             val src = row * yStride
-            System.arraycopy(y, src, out, o, w)
+            if (src + w <= y.size) System.arraycopy(y, src, out, o, w)
             o += w
         }
-        // UV plane (NV12 = interleaved U,V), half resolution.
+        // Interleaved chroma, half resolution.
         val cw = w / 2; val ch = h / 2
         var uvO = w * h
         for (row in 0 until ch) {
-            val uRow = row * uvStride
-            val vRow = row * uvStride
+            val rowBase = row * uvStride
             var col = 0
             while (col < cw) {
-                val uIdx = uRow + col * uvPixelStride
-                val vIdx = vRow + col * uvPixelStride
-                out[uvO++] = if (uIdx < u.size) u[uIdx] else 0
-                out[uvO++] = if (vIdx < v.size) v[vIdx] else 0
+                val idx = rowBase + col * uvPixelStride
+                val up = if (idx < u.size) u[idx] else 0
+                val vp = if (idx < v.size) v[idx] else 0
+                if (semiPlanarVU) { out[uvO++] = vp; out[uvO++] = up }  // NV21 (V,U)
+                else              { out[uvO++] = up; out[uvO++] = vp }  // NV12 (U,V)
                 col++
             }
         }
         return out
     }
+
+    // Chroma byte order for the packed semi-planar buffer (see packYuv). Set in
+    // start() from the encoder's chosen color format. Defaults to NV21 because
+    // that matched the device that showed green under the NV12 ordering.
+    private var semiPlanarVU = true
 
     private fun pickColorFormat(mime: String): Int {
         try {
