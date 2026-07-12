@@ -4,6 +4,7 @@ import 'package:flutter/foundation.dart';
 import 'package:camera/camera.dart';
 import 'jpeg_encoder.dart';
 import 'h264_encoder_channel.dart';
+import 'cam2_encoder_channel.dart';
 
 /// Owns the camera hardware: preview, live frame capture, zoom, flip and torch.
 ///
@@ -28,6 +29,16 @@ class CameraService extends ChangeNotifier {
   // encoder instead of the Dart JPEG isolate. The connection layer wires
   // [onH264Au] to frame each access unit for the wire.
   final H264EncoderChannel _h264 = H264EncoderChannel();
+  // Camera2 zero-copy encoder — reliable H.264 (no green) BUT currently causes a
+  // freeze on connect (camera-ownership conflict + no phone preview). Disabled
+  // for now; we use the stable ByteBuffer path with the getInputImage green fix.
+  // Re-enable once Camera2 preview + lifecycle are fully built (staged Phase 2).
+  final Cam2EncoderChannel _cam2 = Cam2EncoderChannel();
+  bool _useCam2 = false;             // OFF — ByteBuffer path is stable + shows preview
+  bool _cam2Active = false;
+  int _cam2SensorOrientation = 90;
+  int get cam2SensorOrientation => _cam2SensorOrientation;
+  bool get isCam2Active => _cam2Active;
   bool _h264Mode = false;
   bool _h264Started = false;
   bool _h264NeedsStart = false; // start encoder from the next frame's real size
@@ -40,13 +51,18 @@ class CameraService extends ChangeNotifier {
   bool get isH264Mode => _h264Mode;
 
   // ── Adaptive quality (Section 6) ─────────────────────────────────────────────
-  // Start at a low-latency profile; reportBacklog() nudges it up/down. Bounds per
-  // spec but defaults tuned for "live, no lag" over WiFi.
-  static const int _maxFps = 30, _minFps = 15;
-  static const int _maxQuality = 80, _minQuality = 40;
-  static const int _maxOutWidth = 854; // ~480p-wide JPEG → small, fast to encode + send
-  int _targetFps = 24;
-  int _jpegQuality = 60;
+  // Tuned for "best quality + lowest latency" on MJPEG over WiFi. Start HIGH and
+  // let reportBacklog() drop only if the link genuinely can't keep up. Higher
+  // than the old 854/60/24 defaults — the isolate encoder + drop-to-latest keep
+  // latency low even at these settings.
+  static const int _maxFps = 30, _minFps = 20;
+  static const int _maxQuality = 85, _minQuality = 55;
+  // 1024-wide JPEG — a real quality jump over the old 854 while keeping the Dart
+  // isolate encode fast enough for 30fps + low latency. (Pure 1280 slowed the
+  // encode and ADDED latency, which is the opposite of the goal.)
+  static const int _maxOutWidth = 1024;
+  int _targetFps = 30;
+  int _jpegQuality = 80;
   int _lowBacklogStreak = 0;
 
   double _zoom = 1.0;
@@ -186,6 +202,41 @@ class CameraService extends ChangeNotifier {
     final fpsChanged = fps != null && fps != _targetFps;
     if (fps != null) _targetFps = fps.clamp(_minFps, 60);
 
+    // ── Camera2 zero-copy path (reliable H.264, no green) ────────────────────
+    if (_useCam2) {
+      final w = width ?? _h264Width;
+      final h = height ?? _h264Height;
+      final f = _targetFps;
+      final br = _h264Bitrate;
+      if (enabled) {
+        if (_cam2Active && !fpsChanged && (width == null || width == _h264Width)) {
+          if (bitrate != null) await _cam2.setBitrate(br); // live retune
+          return;
+        }
+        _h264Width = w; _h264Height = h;
+        // Release the Flutter camera plugin so Camera2 can own the device.
+        await _stopPluginStream();
+        _cam2.onAu = (au) => onH264Au?.call(au);
+        _cam2.onError = (r) => debugPrint('[CameraService] cam2 error: $r');
+        final ok = await _cam2.start(
+          width: w, height: h, fps: f, bitrate: br,
+          front: lensDirection == CameraLensDirection.front,
+        );
+        _cam2Active = ok;
+        _h264Mode = ok;
+        _cam2SensorOrientation = _cam2.sensorOrientation;
+        debugPrint('[CameraService] Cam2 ${ok ? "started" : "FAILED"} ${w}x$h @${f}fps ${br ~/ 1000}k sensorOri=$_cam2SensorOrientation');
+      } else {
+        await _cam2.stop();
+        _cam2Active = false;
+        _h264Mode = false;
+        // Return the camera to the Flutter plugin (preview/MJPEG).
+        await _restartPluginStream();
+      }
+      notifyListeners();
+      return;
+    }
+
     // IMPORTANT: never re-open the camera here. The camera always captures at
     // 1080p (_preset). Re-initializing the controller mid-stream caused a
     // connect/disconnect storm on device. ABR tiers below 1080p simply lower the
@@ -220,11 +271,10 @@ class CameraService extends ChangeNotifier {
     notifyListeners();
   }
 
-  /// Push the latest ABR target into the running H.264 encoder (bitrate is
-  /// applied live; resolution change requires a restart — handled by the ABR
-  /// controller via setH264Mode).
+  /// Push the latest ABR target into the running encoder (live bitrate change).
   Future<void> updateH264Bitrate(int bitrate) async {
     _h264Bitrate = bitrate;
+    if (_cam2Active) { await _cam2.setBitrate(bitrate); return; }
     if (_h264Mode && _h264Started) await _h264.setBitrate(bitrate);
   }
 
@@ -232,11 +282,34 @@ class CameraService extends ChangeNotifier {
   // frames (the original lag/black cause). At most one forced keyframe / 2s.
   DateTime _lastKeyframeReq = DateTime.fromMillisecondsSinceEpoch(0);
   Future<void> requestH264Keyframe() async {
-    if (!_h264Mode || !_h264Started) return;
     final now = DateTime.now();
     if (now.difference(_lastKeyframeReq).inMilliseconds < 2000) return;
     _lastKeyframeReq = now;
-    await _h264.requestKeyframe();
+    if (_cam2Active) { await _cam2.requestKeyframe(); return; }
+    if (_h264Mode && _h264Started) await _h264.requestKeyframe();
+  }
+
+  // Stop the Flutter camera plugin's image stream + controller so Camera2 can
+  // take exclusive ownership of the hardware. The preview goes dark on the phone
+  // while Camera2 streams (staged: preview returns in a later step).
+  Future<void> _stopPluginStream() async {
+    final c = _controller;
+    _streaming = false;
+    try { if (c != null && c.value.isStreamingImages) await c.stopImageStream(); } catch (_) {}
+    try { await c?.dispose(); } catch (_) {}
+    _controller = null;
+    notifyListeners();
+  }
+
+  // Re-open the Flutter plugin controller (for MJPEG / preview) after Camera2.
+  Future<void> _restartPluginStream() async {
+    try { await _startController(); } catch (_) {}
+    if (_streaming) return;
+    final c = _controller;
+    if (c != null && c.value.isInitialized) {
+      _streaming = true;
+      try { await c.startImageStream(_onCameraImage); } catch (_) { _streaming = false; }
+    }
   }
 
   Future<void> startStreaming() async {
@@ -378,11 +451,12 @@ class CameraService extends ChangeNotifier {
     }
   }
 
-  /// Adaptive quality (Section 6). The screen calls this every ~500ms with the
-  /// socket's pending-byte backlog. Above 200KB → step down; sustained low
-  /// backlog → step back up. Bounds: q40-85, 15-30fps.
+  /// Adaptive quality. Called every ~500ms with the socket's pending-byte
+  /// backlog. Thresholds are tuned to the low-latency _maxPendingBytes (96KB):
+  /// step DOWN above 60KB (link struggling), step UP when sustained below 20KB.
+  /// Bounds: q55-85, 20-30fps.
   void reportBacklog(int pendingBytes) {
-    if (pendingBytes > 200 * 1024) {
+    if (pendingBytes > 60 * 1024) {
       _lowBacklogStreak = 0;
       final newQ = (_jpegQuality - 5).clamp(_minQuality, _maxQuality);
       final newF = (_targetFps - 5).clamp(_minFps, _maxFps);
@@ -391,7 +465,7 @@ class CameraService extends ChangeNotifier {
         debugPrint('[Adaptive] backlog ${(pendingBytes/1024).round()}KB → q$_jpegQuality ${_targetFps}fps (down)');
         notifyListeners();
       }
-    } else if (pendingBytes < 50 * 1024) {
+    } else if (pendingBytes < 20 * 1024) {
       _lowBacklogStreak++;
       if (_lowBacklogStreak >= 3) {
         _lowBacklogStreak = 0;
@@ -408,9 +482,26 @@ class CameraService extends ChangeNotifier {
     }
   }
 
+  /// Rotation (deg) to make the JPEG land upright/landscape on the desktop.
+  /// The app is landscape-locked; the camera sensor is usually mounted 90°, so a
+  /// 90° image rotation puts the feed horizontal. Front cameras are mirrored, so
+  /// their effective rotation is negated. Tunable via [_extraRotation] if a given
+  /// device needs a different offset.
+  int _extraRotation = 0;
+  int _computeRotation() {
+    final sensor = _cameras.isNotEmpty ? _cameras[_cameraIndex].sensorOrientation : 90;
+    // For a landscape-locked app, subtract 90 from the sensor orientation to
+    // land horizontal. Front camera counter-rotates.
+    final front = lensDirection == CameraLensDirection.front;
+    var deg = (sensor - 90 + _extraRotation) % 360;
+    if (front) deg = (360 - deg) % 360;
+    return ((deg % 360) + 360) % 360;
+  }
+
   /// Copy the camera planes into a transferable [RawFrame] for the isolate.
   RawFrame? _packFrame(CameraImage image) {
     final mirror = lensDirection == CameraLensDirection.front;
+    final rot = _computeRotation();
     if (image.format.group == ImageFormatGroup.yuv420) {
       if (image.planes.length < 3) return null;
       return RawFrame(
@@ -420,6 +511,7 @@ class CameraService extends ChangeNotifier {
         maxWidth: _maxOutWidth,
         quality: _jpegQuality,
         mirror: mirror,
+        rotation: rot,
         y: image.planes[0].bytes,
         u: image.planes[1].bytes,
         v: image.planes[2].bytes,
@@ -435,6 +527,7 @@ class CameraService extends ChangeNotifier {
         maxWidth: _maxOutWidth,
         quality: _jpegQuality,
         mirror: mirror,
+        rotation: rot,
         bgra: image.planes[0].bytes,
       );
     }
@@ -546,6 +639,57 @@ class CameraService extends ChangeNotifier {
     return true;
   }
 
+  // ── Quality ladder (Phase 1) ─────────────────────────────────────────────────
+  // User-selectable resolution tiers. Each maps to a camera ResolutionPreset and
+  // a sensible H.264 bitrate. 4K needs a capable device + strong link.
+  int _targetLongEdge = 1920;   // requested longest edge (px)
+  int _targetLadderFps = 30;    // requested fps (30 or 60)
+  int get targetLongEdge => _targetLongEdge;
+  int get targetLadderFps => _targetLadderFps;
+
+  static int bitrateFor(int longEdge, int fps) {
+    // H.264 CBR bitrates tuned per resolution; scaled up for 60fps.
+    final base = longEdge >= 3840 ? 20000000   // 4K   ~20 Mbps
+        : longEdge >= 2560 ? 12000000           // 2K   ~12 Mbps
+        : longEdge >= 1920 ? 6000000            // 1080p ~6 Mbps
+        : longEdge >= 1280 ? 3000000            // 720p  ~3 Mbps
+        : longEdge >= 854  ? 1500000            // 480p  ~1.5 Mbps
+        : 900000;                               // 360p  ~0.9 Mbps
+    return fps >= 60 ? (base * 3) ~/ 2 : base;  // +50% for 60fps
+  }
+
+  static ResolutionPreset _presetForLongEdge(int longEdge) {
+    if (longEdge >= 3840) return ResolutionPreset.max;      // 4K (device max)
+    if (longEdge >= 1920) return ResolutionPreset.veryHigh; // 1080p
+    if (longEdge >= 1280) return ResolutionPreset.high;     // 720p
+    if (longEdge >= 640)  return ResolutionPreset.medium;   // 480p
+    return ResolutionPreset.low;                            // 360p
+  }
+
+  /// Apply a full quality tier: resolution (longest edge) + fps. Re-opens the
+  /// camera at the new preset and (in H.264 mode) restarts the encoder at the
+  /// matching bitrate. Used by Settings and the desktop 'set_format' command.
+  Future<Map<String, int>> setQuality({required int longEdge, required int fps}) async {
+    _targetLongEdge = longEdge;
+    _targetLadderFps = fps.clamp(15, 60);
+    final newPreset = _presetForLongEdge(longEdge);
+    final presetChanged = newPreset != _preset;
+    _preset = newPreset;
+    if (presetChanged) await _startController();
+    if (_h264Mode) {
+      final br = bitrateFor(longEdge, _targetLadderFps);
+      await setH264Mode(true,
+          width: longEdge, height: (longEdge * 9 / 16).round(),
+          fps: _targetLadderFps, bitrate: br);
+    }
+    final size = _controller?.value.previewSize;
+    return {
+      'width': size?.width.round() ?? longEdge,
+      'height': size?.height.round() ?? (longEdge * 9 / 16).round(),
+      'fps': _targetLadderFps,
+    };
+  }
+
   /// Map a requested resolution to the nearest [ResolutionPreset] and apply it.
   /// The camera plugin can't set arbitrary width/height/fps, so we pick the
   /// closest preset and report back what was actually selected.
@@ -589,6 +733,7 @@ class CameraService extends ChangeNotifier {
     _disposeController();
     _encoder.dispose();
     _h264.stop();
+    _cam2.stop();
     super.dispose();
   }
 }

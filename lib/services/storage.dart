@@ -9,6 +9,8 @@ class AppSettings {
   final bool audioEnabled;
   final int wsPort;
   final int tcpPort;
+  final int videoLongEdge; // requested longest edge px (3840=4K … 640=360p)
+  final int videoFps;      // 30 | 60
 
   const AppSettings({
     this.deviceName = 'Church Mobile',
@@ -16,22 +18,27 @@ class AppSettings {
     this.audioEnabled = false,
     this.wsPort = 8765,
     this.tcpPort = 8766,
+    this.videoLongEdge = 1920, // default 1080p
+    this.videoFps = 30,
   });
 
   AppSettings copyWith({
     String? deviceName, String? preferredPosition, bool? audioEnabled,
-    int? wsPort, int? tcpPort,
+    int? wsPort, int? tcpPort, int? videoLongEdge, int? videoFps,
   }) => AppSettings(
         deviceName: deviceName ?? this.deviceName,
         preferredPosition: preferredPosition ?? this.preferredPosition,
         audioEnabled: audioEnabled ?? this.audioEnabled,
         wsPort: wsPort ?? this.wsPort,
         tcpPort: tcpPort ?? this.tcpPort,
+        videoLongEdge: videoLongEdge ?? this.videoLongEdge,
+        videoFps: videoFps ?? this.videoFps,
       );
 
   Map<String, dynamic> toJson() => {
         'deviceName': deviceName, 'preferredPosition': preferredPosition,
         'audioEnabled': audioEnabled, 'wsPort': wsPort, 'tcpPort': tcpPort,
+        'videoLongEdge': videoLongEdge, 'videoFps': videoFps,
       };
 
   factory AppSettings.fromJson(Map j) => AppSettings(
@@ -40,6 +47,8 @@ class AppSettings {
         audioEnabled: j['audioEnabled'] == true,
         wsPort: (j['wsPort'] is int) ? j['wsPort'] as int : 8765,
         tcpPort: (j['tcpPort'] is int) ? j['tcpPort'] as int : 8766,
+        videoLongEdge: (j['videoLongEdge'] is int) ? j['videoLongEdge'] as int : 1920,
+        videoFps: (j['videoFps'] is int) ? j['videoFps'] as int : 30,
       );
 }
 

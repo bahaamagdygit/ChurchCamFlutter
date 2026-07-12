@@ -447,8 +447,11 @@ class ConnectionService extends ChangeNotifier {
   // latency that never recovers).
   int _pendingBytes = 0;
   bool _flushing = false;
-  // Allow at most ~2 frames' worth of un-flushed data before we start dropping.
-  static const int _maxPendingBytes = 256 * 1024;
+  // LOW-LATENCY: allow only ~1 frame of un-flushed data. The moment the socket
+  // is behind by more than one frame, we DROP new frames instead of queueing —
+  // queued frames are stale by the time they arrive, which is exactly the delay
+  // we're eliminating. Smaller = fresher picture, zero accumulating lag.
+  static const int _maxPendingBytes = 96 * 1024;
 
   /// True when the socket can accept another frame without building a backlog.
   /// The camera calls this before encoding so it never wastes CPU on a frame

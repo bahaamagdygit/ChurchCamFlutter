@@ -104,22 +104,27 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
       );
     };
     // If the desktop negotiated h264, switch the camera into hardware-encode
-    // mode. Wrapped so an encoder/camera failure falls back gracefully instead
-    // of crashing the screen (which would look like a connect/disconnect storm).
+    // mode at the user's SELECTED resolution/fps (from Settings). Wrapped so an
+    // encoder/camera failure falls back gracefully.
     if (_conn?.videoCodec == 'h264') {
       try {
-        // Start CONSERVATIVE (720p30 @ 2.5Mbps). Starting too high saturates the
-        // WiFi, delays heartbeat pings → heartbeat_timeout → reconnect storm.
-        // The ABR controller climbs to 1080p only once the link proves stable.
-        await _camera.setH264Mode(true, width: 1280, height: 720, fps: 30, bitrate: 2500000);
+        final s = await loadSettings();
+        final longEdge = s.videoLongEdge; // 3840=4K … 640=360p
+        final fps = s.videoFps;           // 30 | 60
+        final bitrate = CameraService.bitrateFor(longEdge, fps);
+        await _camera.setH264Mode(true,
+            width: longEdge, height: (longEdge * 9 / 16).round(),
+            fps: fps, bitrate: bitrate);
+        // ABR may step DOWN under congestion but never above the user's choice.
         _abr = AbrController(
-          startTier: 3, // 720p30 in the ladder
+          startTier: AbrController.tierForLongEdge(longEdge, fps),
           onTierChange: (t) async {
             await _camera.setH264Mode(true, width: t.width, height: t.height, fps: t.fps, bitrate: t.bitrate);
             await _camera.requestH264Keyframe();
           },
           onBitrate: (br) => _camera.updateH264Bitrate(br),
         );
+        debugPrint('[CameraScreen] H.264 start @ ${longEdge}p ${fps}fps ${bitrate ~/ 1000}kbps');
       } catch (e) {
         debugPrint('[CameraScreen] H.264 setup failed, staying on MJPEG: $e');
       }
@@ -131,9 +136,9 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
     await _camera.startStreaming();
     _camera.addListener(_onCameraChanged);
 
-    // Adaptive-quality tick: h264 drives the ABR ladder; mjpeg uses the legacy
-    // per-frame quality nudge. Runs every 1s for ABR / 500ms for mjpeg backlog.
-    _adaptiveTimer = Timer.periodic(const Duration(milliseconds: 1000), (_) {
+    // Adaptive-quality tick — 400ms for a fast reaction to link changes so the
+    // quality recovers quickly and latency never accumulates (MJPEG backlog path).
+    _adaptiveTimer = Timer.periodic(const Duration(milliseconds: 400), (_) {
       final abr = _abr;
       if (abr != null && _camera.isH264Mode) {
         abr.tick(pendingBytes: _conn?.pendingVideoBytes ?? 0, targetFps: _camera.targetFps);
@@ -145,9 +150,14 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
     if (mounted) setState(() => _initializing = false);
   }
 
+  // ALWAYS LANDSCAPE: the app is locked to landscape, so the feed is always
+  // horizontal. We report angle 0 to the desktop at all times → the studio
+  // output stays horizontal, matching the phone's locked orientation.
+  static const int _kForcedAngle = 0;
+
   Map<String, dynamic> _buildStateRestore() => {
         'capabilities': _camera.capabilities(),
-        'orientationAngle': _orientation.angle,
+        'orientationAngle': _kForcedAngle,
         'zoom': _camera.zoom,
         'filters': _filters.toJson(),
       };
@@ -155,7 +165,7 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
   void _onCameraChanged() { if (mounted) setState(() {}); }
 
   void _onOrientation() {
-    _conn?.sendOrientationAngle(_orientation.angle);
+    _conn?.sendOrientationAngle(_kForcedAngle);
     if (mounted) setState(() {});
   }
 
@@ -192,6 +202,7 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
         }
         break;
       case 'exposure':
+      case 'set_exposure':
         if (cmd.value is num) {
           final applied = await _camera.setExposure((cmd.value as num).toDouble());
           conn?.confirmControl('exposure', applied);
@@ -212,6 +223,7 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
         }
         break;
       case 'white_balance':
+      case 'set_white_balance':
         if (_camera.whiteBalanceSupported) {
           conn?.confirmControl('white_balance', cmd.value);
         } else {
@@ -220,11 +232,21 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
         break;
       case 'torch':
       case 'toggle_torch':
-        await _camera.toggleTorch();
-        conn?.confirmControl('torch', _camera.torchOn ? 'on' : 'off');
+      case 'set_torch':
+        {
+          // set_torch carries an explicit on/off; torch/toggle_torch toggle.
+          final v = cmd.value;
+          final wantOn = v == true || v == 'on' || v == 1;
+          final wantOff = v == false || v == 'off' || v == 0;
+          if (wantOn && !_camera.torchOn) await _camera.toggleTorch();
+          else if (wantOff && _camera.torchOn) await _camera.toggleTorch();
+          else if (!wantOn && !wantOff) await _camera.toggleTorch(); // no explicit value → toggle
+          conn?.confirmControl('torch', _camera.torchOn ? 'on' : 'off');
+        }
         break;
       case 'flip':
       case 'switch_camera':
+      case 'camera_flip':
         if (cmd.value == 'front') {
           await _camera.switchToPosition(CameraLensDirection.front);
         } else if (cmd.value == 'back') {
@@ -234,6 +256,18 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
         }
         conn?.sendCapabilities(_camera.capabilities());
         conn?.confirmControl('flip', _camera.lensDirection.name);
+        break;
+      case 'set_format':
+      case 'format':
+        // Desktop requests an encoder format/resolution. Map to setResolution.
+        if (cmd.value is Map) {
+          final w = (cmd.value['width'] as num?)?.toInt() ?? 1280;
+          final h = (cmd.value['height'] as num?)?.toInt() ?? 720;
+          final applied = await _camera.setResolution(w, h);
+          conn?.confirmControl('format', applied);
+        } else {
+          conn?.reportUnsupported('set_format', 'expected {width,height}');
+        }
         break;
       case 'resolution':
         if (cmd.value is Map) {
@@ -250,6 +284,11 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
           await saveFilters(_camera.lensDirection.name, _filters);
           conn?.confirmControl('filters', _filters.toJson());
         }
+        break;
+      default:
+        // Log + report anything we don't handle so the desktop knows.
+        debugPrint('[CameraScreen] unsupported command: ${cmd.action}');
+        conn?.reportUnsupported(cmd.action, 'not implemented on mobile');
         break;
     }
   }
@@ -392,15 +431,18 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
 
   Widget _buildPreview() {
     final controller = _camera.controller!;
-    final size = MediaQuery.of(context).size;
+    // Landscape-locked: fill the whole screen with the camera feed. The camera
+    // reports its aspect ratio in the sensor's natural (portrait) orientation, so
+    // in landscape we use its INVERSE. BoxFit.cover crops to fill without bars.
+    final ar = controller.value.aspectRatio;
+    final landscapeAr = ar > 1 ? ar : (1 / ar); // ensure ≥1 (wide) for landscape
     return ClipRect(
-      child: OverflowBox(
-        maxWidth: double.infinity, maxHeight: double.infinity,
+      child: SizedBox.expand(
         child: FittedBox(
           fit: BoxFit.cover,
           child: SizedBox(
-            width: size.width,
-            height: size.width * controller.value.aspectRatio,
+            width: landscapeAr * 1000,
+            height: 1000,
             child: CameraPreview(controller),
           ),
         ),

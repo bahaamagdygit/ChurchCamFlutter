@@ -63,9 +63,9 @@ class H264Encoder(
             format.setInteger(MediaFormat.KEY_COLOR_FORMAT, colorFormat)
             format.setInteger(MediaFormat.KEY_BIT_RATE, bitrate)
             format.setInteger(MediaFormat.KEY_FRAME_RATE, fps)
-            // Keyframe every 2s. Frequent IDRs eat the bitrate budget and starve
-            // P-frames → blocky/blurry motion. 2s + on-demand resync is plenty.
-            format.setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 2)
+            // Keyframe every 1s — fast recovery if the decoder ever has to resync,
+            // and the desktop now feeds all deltas so IDRs no longer dominate.
+            format.setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1)
             // CBR keeps a STEADY bitrate so motion scenes don't spike past the
             // link capacity (the spike was the visible blur/stutter on motion).
             format.setInteger(MediaFormat.KEY_BITRATE_MODE,
@@ -144,19 +144,28 @@ class H264Encoder(
         try {
             val inIndex = c.dequeueInputBuffer(0)  // 0 = don't block; drop if busy
             if (inIndex >= 0) {
-                // Direct ByteBuffer path: pack a TIGHT (unpadded) NV12/NV21 buffer
-                // of exactly width*height*3/2 bytes and pass that exact size to
-                // queueInputBuffer. This is the proven path that produced a visible
-                // image; getInputImage() was fragile across devices and broke frame
-                // production. The semiPlanarVU flag fixes the U/V order (green).
-                val input = c.getInputBuffer(inIndex)
-                if (input != null) {
-                    input.clear()
-                    val packed = packYuv(y, u, v, yStride, uvStride, uvPixelStride)
-                    input.put(packed, 0, width * height * 3 / 2)
+                // ROBUST path (fixes green across ALL devices): write into the
+                // encoder's own input Image via getInputImage(), honoring the
+                // encoder's REAL plane strides and order. This removes the NV12 vs
+                // NV21 guessing entirely — the Image API places U/V correctly for
+                // whatever internal layout the device uses. The size passed to
+                // queueInputBuffer is width*height*3/2 (the Image's logical size).
+                val img = if (useInputImage) (try { c.getInputImage(inIndex) } catch (_: Throwable) { null }) else null
+                if (img != null) {
+                    fillInputImage(img, y, u, v, yStride, uvStride, uvPixelStride)
                     c.queueInputBuffer(inIndex, 0, width * height * 3 / 2, ptsUs, 0)
                 } else {
-                    c.queueInputBuffer(inIndex, 0, 0, ptsUs, 0)
+                    // Fallback: tight NV12/NV21 pack (semiPlanarVU picks the order).
+                    useInputImage = false
+                    val input = c.getInputBuffer(inIndex)
+                    if (input != null) {
+                        input.clear()
+                        val packed = packYuv(y, u, v, yStride, uvStride, uvPixelStride)
+                        input.put(packed, 0, width * height * 3 / 2)
+                        c.queueInputBuffer(inIndex, 0, width * height * 3 / 2, ptsUs, 0)
+                    } else {
+                        c.queueInputBuffer(inIndex, 0, 0, ptsUs, 0)
+                    }
                 }
             }
             drainOutput(c)
@@ -232,10 +241,63 @@ class H264Encoder(
         return out
     }
 
-    // Chroma byte order for the packed semi-planar buffer (see packYuv). Set in
-    // start() from the encoder's chosen color format. Defaults to NV21 because
-    // that matched the device that showed green under the NV12 ordering.
+    // Chroma byte order for the FALLBACK packed semi-planar buffer (see packYuv).
     private var semiPlanarVU = true
+    // Prefer the encoder's own input Image (correct on all layouts). If a device
+    // rejects getInputImage we flip this and use the tight-pack fallback.
+    private var useInputImage = true
+
+    /**
+     * Write a source YUV_420_888 frame into the encoder's input Image, honoring
+     * the ENCODER's own plane strides and pixel strides. This is layout-agnostic:
+     * the Android Image API places each U/V sample at the correct offset whether
+     * the device is planar (I420) or semi-planar (NV12/NV21) — so it fixes the
+     * green corruption without any NV12/NV21 guessing.
+     */
+    private fun fillInputImage(
+        img: android.media.Image,
+        y: ByteArray, u: ByteArray, v: ByteArray,
+        srcYStride: Int, srcUvStride: Int, srcUvPixelStride: Int,
+    ) {
+        val w = width; val h = height
+        val p = img.planes
+
+        // Y plane — row-by-row, honoring source + dest strides.
+        run {
+            val dst = p[0].buffer
+            val dStride = p[0].rowStride
+            val base = dst.position()
+            val row = ByteArray(w)
+            for (r in 0 until h) {
+                val s = r * srcYStride
+                if (s + w <= y.size) System.arraycopy(y, s, row, 0, w) else java.util.Arrays.fill(row, 0)
+                dst.position(base + r * dStride)
+                dst.put(row, 0, w)
+            }
+        }
+
+        // U and V planes — write each sample at its own plane's row/pixel stride.
+        // For semi-planar dest, p[1] and p[2] alias one buffer with pixelStride 2;
+        // writing through each plane's own position handles both layouts.
+        val cw = w / 2; val ch = h / 2
+        val uDst = p[1].buffer; val vDst = p[2].buffer
+        val uRS = p[1].rowStride; val vRS = p[2].rowStride
+        val uPS = p[1].pixelStride; val vPS = p[2].pixelStride
+        val uBase = uDst.position(); val vBase = vDst.position()
+        for (r in 0 until ch) {
+            val sRow = r * srcUvStride
+            var uPos = uBase + r * uRS
+            var vPos = vBase + r * vRS
+            var col = 0
+            while (col < cw) {
+                val sIdx = sRow + col * srcUvPixelStride
+                if (uPos < uDst.limit()) { uDst.position(uPos); uDst.put(if (sIdx < u.size) u[sIdx] else 0) }
+                if (vPos < vDst.limit()) { vDst.position(vPos); vDst.put(if (sIdx < v.size) v[sIdx] else 0) }
+                uPos += uPS; vPos += vPS
+                col++
+            }
+        }
+    }
 
     private fun pickColorFormat(mime: String): Int {
         try {
@@ -244,12 +306,14 @@ class H264Encoder(
                 if (!ci.isEncoder) continue
                 if (!ci.supportedTypes.any { it.equals(mime, true) }) continue
                 val caps = ci.getCapabilitiesForType(mime)
-                for (cf in caps.colorFormats) {
-                    if (cf == MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420Flexible ||
-                        cf == MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420SemiPlanar) {
-                        return cf
-                    }
-                }
+                val fmts = caps.colorFormats.toSet()
+                // PREFER Flexible — it works with getInputImage() (the layout-
+                // agnostic fill that fixes green on every device). Fall back to
+                // SemiPlanar only if Flexible is unavailable.
+                if (fmts.contains(MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420Flexible))
+                    return MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420Flexible
+                if (fmts.contains(MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420SemiPlanar))
+                    return MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420SemiPlanar
             }
         } catch (_: Exception) {}
         return MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420Flexible

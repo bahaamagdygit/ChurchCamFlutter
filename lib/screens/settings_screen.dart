@@ -21,9 +21,24 @@ class _SettingsScreenState extends State<SettingsScreen> {
   final _nameCtrl = TextEditingController();
   final _wsCtrl = TextEditingController();
   final _tcpCtrl = TextEditingController();
-  String _resolution = '720p';
+  String _resolution = '1080p';
+  int _fps = 30;
 
-  static const _resolutions = ['480p', '720p', '1080p', '4K'];
+  // Full ladder. Each label maps to a longest-edge px in _longEdgeFor().
+  static const _resolutions = ['360p', '480p', '720p', '1080p', '2K', '4K'];
+  static const _fpsOptions = [30, 60];
+
+  static int longEdgeFor(String label) {
+    switch (label) {
+      case '4K': return 3840;
+      case '2K': return 2560;
+      case '1080p': return 1920;
+      case '720p': return 1280;
+      case '480p': return 854;
+      case '360p': return 640;
+      default: return 1920;
+    }
+  }
 
   @override
   void initState() {
@@ -35,8 +50,19 @@ class _SettingsScreenState extends State<SettingsScreen> {
         _nameCtrl.text = s.deviceName;
         _wsCtrl.text = s.wsPort.toString();
         _tcpCtrl.text = s.tcpPort.toString();
+        _resolution = _labelForLongEdge(s.videoLongEdge);
+        _fps = s.videoFps;
       });
     });
+  }
+
+  static String _labelForLongEdge(int e) {
+    if (e >= 3840) return '4K';
+    if (e >= 2560) return '2K';
+    if (e >= 1920) return '1080p';
+    if (e >= 1280) return '720p';
+    if (e >= 854) return '480p';
+    return '360p';
   }
 
   Future<void> _persist() async {
@@ -44,6 +70,8 @@ class _SettingsScreenState extends State<SettingsScreen> {
       deviceName: _nameCtrl.text.trim().isEmpty ? 'Church Mobile' : _nameCtrl.text.trim(),
       wsPort: int.tryParse(_wsCtrl.text) ?? 8765,
       tcpPort: int.tryParse(_tcpCtrl.text) ?? 8766,
+      videoLongEdge: longEdgeFor(_resolution),
+      videoFps: _fps,
     );
     await saveSettings(_s);
   }
@@ -78,8 +106,27 @@ class _SettingsScreenState extends State<SettingsScreen> {
               value: _resolution, isExpanded: true, dropdownColor: _card,
               style: const TextStyle(color: Colors.white),
               items: _resolutions.map((r) => DropdownMenuItem(value: r, child: Text(r))).toList(),
-              onChanged: (v) => setState(() => _resolution = v ?? '720p'),
+              onChanged: (v) async {
+                if (v == null) return;
+                setState(() => _resolution = v);
+                await _persist();
+              },
             )),
+            const SizedBox(height: 8),
+            _labeled('Frame rate', DropdownButton<int>(
+              value: _fps, isExpanded: true, dropdownColor: _card,
+              style: const TextStyle(color: Colors.white),
+              items: _fpsOptions.map((f) => DropdownMenuItem(value: f, child: Text('$f fps'))).toList(),
+              onChanged: (v) async {
+                if (v == null) return;
+                setState(() => _fps = v);
+                await _persist();
+              },
+            )),
+            const SizedBox(height: 8),
+            const Text('4K/60fps need a capable phone + strong Wi-Fi. If video '
+                'stutters, drop to 1080p/30.',
+                style: TextStyle(color: Colors.white38, fontSize: 11)),
             const SizedBox(height: 8),
             _toggleRow('Preferred camera: ${_s.preferredPosition == 'front' ? 'Front' : 'Back'}',
                 _s.preferredPosition == 'front', (v) async {

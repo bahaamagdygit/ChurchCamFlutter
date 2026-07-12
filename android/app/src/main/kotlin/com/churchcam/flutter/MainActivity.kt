@@ -20,6 +20,7 @@ import io.flutter.plugin.common.MethodChannel
  */
 class MainActivity : FlutterActivity() {
     private var encoder: H264Encoder? = null
+    private var cam2: Camera2Encoder? = null
     private var auSink: EventChannel.EventSink? = null
 
     override fun configureFlutterEngine(@NonNull flutterEngine: FlutterEngine) {
@@ -119,5 +120,48 @@ class MainActivity : FlutterActivity() {
                 else -> result.notImplemented()
             }
         }
+
+        // ── Camera2 zero-copy encoder (churchcam/cam2) ───────────────────────
+        // Camera renders directly into the encoder Surface — no YUV crosses to
+        // Dart, so there is no chroma/green issue. AUs come back on the SAME
+        // EventChannel (churchcam/h264/au) so the Dart receiver is unchanged.
+        MethodChannel(messenger, "churchcam/cam2").setMethodCallHandler { call, result ->
+            when (call.method) {
+                "start" -> {
+                    val w = call.argument<Int>("width") ?: 1920
+                    val h = call.argument<Int>("height") ?: 1080
+                    val fps = call.argument<Int>("fps") ?: 30
+                    val bitrate = call.argument<Int>("bitrate") ?: 6_000_000
+                    val cameraId = call.argument<String>("cameraId") ?: ""
+                    val front = call.argument<Boolean>("front") ?: false
+                    cam2?.stop()
+                    cam2 = Camera2Encoder(
+                        applicationContext,
+                        onEncoded = { type, data, ptsUs ->
+                            runOnUiThread {
+                                auSink?.success(mapOf("type" to type, "ptsUs" to ptsUs, "data" to data))
+                            }
+                        },
+                        onError = { msg -> runOnUiThread { auSink?.error("CAM2", msg, null) } },
+                    )
+                    cam2?.start(w, h, fps, bitrate, cameraId, front)
+                    result.success(mapOf("sensorOrientation" to (cam2?.getSensorOrientation() ?: 90)))
+                }
+                "stop" -> { cam2?.stop(); cam2 = null; result.success(true) }
+                "setBitrate" -> {
+                    val br = call.argument<Int>("bitrate") ?: return@setMethodCallHandler result.success(false)
+                    cam2?.setBitrate(br); result.success(true)
+                }
+                "requestKeyframe" -> { cam2?.requestKeyframe(); result.success(true) }
+                "sensorOrientation" -> result.success(cam2?.getSensorOrientation() ?: 90)
+                else -> result.notImplemented()
+            }
+        }
+    }
+
+    override fun onDestroy() {
+        try { cam2?.stop() } catch (_: Exception) {}
+        try { encoder?.stop() } catch (_: Exception) {}
+        super.onDestroy()
     }
 }

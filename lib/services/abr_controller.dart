@@ -11,13 +11,30 @@ class AbrTier {
 }
 
 const List<AbrTier> kAbrLadder = [
-  AbrTier('1080p60', 1920, 1080, 60, 8000000), // T0 — smoothest (needs strong WiFi)
-  AbrTier('1080p30', 1920, 1080, 30, 6000000), // T1
-  AbrTier('720p60', 1280, 720, 60, 4500000), //  T2
-  AbrTier('720p30', 1280, 720, 30, 3000000), //  T3
-  AbrTier('720p24', 1280, 720, 24, 2000000), //  T4
-  AbrTier('540p24', 960, 540, 24, 1200000), //   T5
+  AbrTier('4K60',   3840, 2160, 60, 30000000), // T0 — highest (needs strong link)
+  AbrTier('4K30',   3840, 2160, 30, 20000000), // T1
+  AbrTier('2K60',   2560, 1440, 60, 18000000), // T2
+  AbrTier('2K30',   2560, 1440, 30, 12000000), // T3
+  AbrTier('1080p60', 1920, 1080, 60, 8000000), // T4
+  AbrTier('1080p30', 1920, 1080, 30, 6000000), // T5
+  AbrTier('720p60', 1280, 720, 60, 4500000), //  T6
+  AbrTier('720p30', 1280, 720, 30, 3000000), //  T7
+  AbrTier('480p30', 854, 480, 30, 1500000), //   T8
+  AbrTier('360p30', 640, 360, 30, 900000), //    T9
 ];
+
+/// Ladder index for a given (longEdge, fps) — the user's Settings choice becomes
+/// the starting tier. ABR only steps DOWN from here under congestion.
+int _tierIndexFor(int longEdge, int fps) {
+  final want60 = fps >= 60;
+  int best = kAbrLadder.length - 1;
+  for (int i = 0; i < kAbrLadder.length; i++) {
+    final t = kAbrLadder[i];
+    if (t.width <= longEdge && (t.fps >= 60) == want60) { best = i; break; }
+    if (t.width <= longEdge) best = i; // fps fallback if exact 60/30 not found
+  }
+  return best;
+}
 
 /// Receive-side stats the desktop reports over the WS (`rx_stats`).
 class RxStats {
@@ -38,6 +55,9 @@ class AbrController extends ChangeNotifier {
     required this.onBitrate,
     int startTier = 1, // default 720p30
   }) : _tierIndex = startTier.clamp(0, kAbrLadder.length - 1);
+
+  /// Ladder index matching the user's Settings choice (starting tier).
+  static int tierForLongEdge(int longEdge, int fps) => _tierIndexFor(longEdge, fps);
 
   /// Restart encoder at a new resolution/fps tier.
   final void Function(AbrTier tier) onTierChange;

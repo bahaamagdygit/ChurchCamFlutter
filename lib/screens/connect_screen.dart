@@ -159,9 +159,11 @@ class _ConnectScreenState extends State<ConnectScreen> {
     final conn = context.read<ConnectionService>();
     final settings = await loadSettings();
     conn.configure(deviceName: settings.deviceName);
-    // Advertise H.264 (hardware) preferred, MJPEG fallback. The desktop selects
-    // h264 only if its build supports decoding it; otherwise we stay on mjpeg.
-    conn.setSupportedVideoCodecs(const ['h264', 'mjpeg']);
+    // MJPEG ONLY — the stable path: no device-specific H.264 chroma (green) and
+    // no Camera2 freeze. Every frame is a full JPEG that decodes cleanly and
+    // renders in preview + menu + presentation. H.264/Camera2 returns later once
+    // its preview/lifecycle are fully built.
+    conn.setSupportedVideoCodecs(const ['mjpeg']);
     final ok = await conn.connect(host, controlPort, videoPort);
     if (!mounted) return;
     setState(() => _connectingKey = null);

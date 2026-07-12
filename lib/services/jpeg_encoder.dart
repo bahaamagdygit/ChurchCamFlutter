@@ -13,6 +13,7 @@ class RawFrame {
   final int maxWidth; // longest output edge
   final int quality; // JPEG quality 0-100
   final bool mirror; // flip horizontally (front camera)
+  final int rotation; // degrees to rotate the JPEG (0/90/180/270) → upright
 
   // yuv420 planes
   final Uint8List? y, u, v;
@@ -28,6 +29,7 @@ class RawFrame {
     required this.maxWidth,
     required this.quality,
     required this.mirror,
+    this.rotation = 0,
     this.y,
     this.u,
     this.v,
@@ -130,6 +132,11 @@ class JpegEncoder {
     }
 
     if (f.mirror) rgb = img.flipHorizontal(rgb);
+    // Rotate to upright/landscape before encoding so the desktop shows the feed
+    // correctly without any desktop-side rotation.
+    if (f.rotation == 90) rgb = img.copyRotate(rgb, angle: 90);
+    else if (f.rotation == 180) rgb = img.copyRotate(rgb, angle: 180);
+    else if (f.rotation == 270) rgb = img.copyRotate(rgb, angle: 270);
 
     return img.encodeJpg(rgb, quality: f.quality);
   }
