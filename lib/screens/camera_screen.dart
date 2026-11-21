@@ -144,7 +144,12 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
     }
     // On every (re)connect of the video socket, force a fresh config+keyframe so
     // the desktop decoder can initialize without a stall.
-    _conn?.onVideoReady = () => _camera.requestH264Keyframe();
+    // A reconnect creates a fresh device on the desktop with no zoom/Smart Zoom
+    // state, so re-send ours along with the keyframe request.
+    _conn?.onVideoReady = () {
+      _camera.requestH264Keyframe();
+      _reportPhoneState();
+    };
 
     await _camera.startStreaming();
     _camera.addListener(_onCameraChanged);
