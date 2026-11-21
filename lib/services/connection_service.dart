@@ -113,6 +113,7 @@ class ConnectionService extends ChangeNotifier {
   List<DesktopCamera> _desktopCameras = const [];
   String _activeCameraLabel = '';
   String _activeCameraId = '';
+  String _previewCameraId = '';
   String _switchTransition = '';
   List<TransitionOption> _transitions = const [];
   bool _streamLive = false;
@@ -139,6 +140,11 @@ class ConnectionService extends ChangeNotifier {
   String get selfCameraId => _deviceId.isEmpty ? '' : 'mobile:$_deviceId';
   /// True when THIS phone is the live program source (drives the tally light).
   bool get isSelfLive => _deviceId.isNotEmpty && _activeCameraId == selfCameraId;
+  /// The director has cued THIS phone as the next camera (green tally).
+  bool get isSelfCued => _deviceId.isNotEmpty && _previewCameraId == selfCameraId && !isSelfLive;
+  String get previewCameraId => _previewCameraId;
+  /// Quick reply from the camera operator to the director ("Ready", "OK"…).
+  void sendDirectorReply(String text) => sendControl('director_reply', text);
   String get switchTransition => _switchTransition;
   List<TransitionOption> get transitions => _transitions;
   bool get streamLive => _streamLive;
@@ -397,6 +403,7 @@ class ConnectionService extends ChangeNotifier {
           if (v['recordingStatus'] != null) _recording = v['recordingStatus'] == 'recording';
           if (v['activeCameraLabel'] != null) _activeCameraLabel = v['activeCameraLabel'].toString();
           if (v['activeCameraId'] != null) _activeCameraId = v['activeCameraId'].toString();
+          if (v.containsKey('previewCameraId')) _previewCameraId = (v['previewCameraId'] ?? '').toString();
           if (v['switchTransition'] != null) _switchTransition = v['switchTransition'].toString();
           if (v['transitions'] is List) {
             _transitions = (v['transitions'] as List)
@@ -620,6 +627,30 @@ class ConnectionService extends ChangeNotifier {
       _flushing = false;
       _log('sendV2Frame failed: $e');
     }
+  }
+
+  /// One 20 ms PCM chunk (s16le mono 48 kHz) as a v2 audio frame. Audio is
+  /// tiny next to video, so it's only dropped when the link is badly backed up
+  /// — a gap in sound is far more noticeable than a dropped video frame.
+  final int _audioEpochUs = DateTime.now().microsecondsSinceEpoch;
+  void sendAudio(Uint8List pcm) {
+    final sock = _videoSocket;
+    if (sock == null || !_videoHeaderSent) return;
+    if (_pendingBytes >= _maxPendingBytes * 6) return;
+    try {
+      final out = encodeV2Frame(
+        type: V2FrameType.audio,
+        payload: pcm,
+        captureTsUs: DateTime.now().microsecondsSinceEpoch - _audioEpochUs,
+      );
+      sock.add(out);
+      _pendingBytes += out.length;
+      if (!_flushing) {
+        _flushing = true;
+        sock.flush().then((_) { _pendingBytes = 0; _flushing = false; })
+            .catchError((_) { _pendingBytes = 0; _flushing = false; });
+      }
+    } catch (_) {}
   }
 
   void _startPing() {

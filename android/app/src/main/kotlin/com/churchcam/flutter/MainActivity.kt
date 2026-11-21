@@ -22,6 +22,8 @@ class MainActivity : FlutterActivity() {
     private var encoder: H264Encoder? = null
     private var cam2: Camera2Encoder? = null
     private var auSink: EventChannel.EventSink? = null
+    private var audio: AudioStreamer? = null
+    private var audioSink: EventChannel.EventSink? = null
 
     override fun configureFlutterEngine(@NonNull flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
@@ -39,6 +41,27 @@ class MainActivity : FlutterActivity() {
         )
 
         // Device info channel — WiFi signal strength (RSSI → 0..4 bars + dBm).
+        // Microphone PCM for the desktop's stream audio (see AudioStreamer).
+        EventChannel(messenger, "churchcam/audio/pcm").setStreamHandler(
+            object : EventChannel.StreamHandler {
+                override fun onListen(args: Any?, events: EventChannel.EventSink?) { audioSink = events }
+                override fun onCancel(args: Any?) { audioSink = null }
+            }
+        )
+        MethodChannel(messenger, "churchcam/audio").setMethodCallHandler { call, result ->
+            when (call.method) {
+                "start" -> {
+                    audio?.stop()
+                    audio = AudioStreamer { data, level ->
+                        runOnUiThread { audioSink?.success(mapOf("data" to data, "level" to level.toDouble())) }
+                    }
+                    result.success(audio?.start() == true)
+                }
+                "stop" -> { audio?.stop(); audio = null; result.success(true) }
+                else -> result.notImplemented()
+            }
+        }
+
         MethodChannel(messenger, "churchcam/device").setMethodCallHandler { call, result ->
             when (call.method) {
                 "wifiSignal" -> {
@@ -162,6 +185,7 @@ class MainActivity : FlutterActivity() {
     override fun onDestroy() {
         try { cam2?.stop() } catch (_: Exception) {}
         try { encoder?.stop() } catch (_: Exception) {}
+        try { audio?.stop() } catch (_: Exception) {}
         super.onDestroy()
     }
 }

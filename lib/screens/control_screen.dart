@@ -1,3 +1,4 @@
+import 'dart:math' as math;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:phosphor_flutter/phosphor_flutter.dart';
@@ -10,7 +11,23 @@ import '../ui/components.dart';
 /// reading text, cut to black, live camera zoom). Lives in the camera screen's
 /// side panel so the operator never leaves the viewfinder.
 class StudioPanel extends StatefulWidget {
-  const StudioPanel({super.key});
+  // This phone's own outputs (owned by the camera screen).
+  final bool audioOn;
+  final double audioLevel;
+  final ValueChanged<bool> onAudioChanged;
+  final bool isoRecording;
+  final String isoElapsed;
+  final ValueChanged<bool> onIsoChanged;
+
+  const StudioPanel({
+    super.key,
+    required this.audioOn,
+    required this.audioLevel,
+    required this.onAudioChanged,
+    required this.isoRecording,
+    required this.isoElapsed,
+    required this.onIsoChanged,
+  });
 
   @override
   State<StudioPanel> createState() => _StudioPanelState();
@@ -25,6 +42,30 @@ class _StudioPanelState extends State<StudioPanel> {
   Widget build(BuildContext context) {
     final conn = context.watch<ConnectionService>();
     return Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+      PanelSection(
+        title: 'This phone',
+        children: [
+          PanelTile(
+            icon: widget.audioOn ? PhosphorIconsFill.microphone : PhosphorIconsRegular.microphoneSlash,
+            title: 'Send microphone',
+            subtitle: widget.audioOn ? 'The desktop can use it as stream audio' : 'Off — video only',
+            highlighted: widget.audioOn, highlightColor: C.ok,
+            trailing: Switch(value: widget.audioOn, onChanged: widget.onAudioChanged),
+          ),
+          if (widget.audioOn)
+            Padding(
+              padding: const EdgeInsets.only(bottom: S.sm, left: S.xs, right: S.xs),
+              child: _LevelBar(level: widget.audioLevel),
+            ),
+          PanelTile(
+            icon: PhosphorIconsFill.videoCamera,
+            title: 'Backup recording',
+            subtitle: widget.isoRecording ? 'Recording ${widget.isoElapsed} — saved to Gallery when stopped' : 'Full-quality copy on this phone',
+            highlighted: widget.isoRecording, highlightColor: C.tally,
+            trailing: Switch(value: widget.isoRecording, onChanged: widget.onIsoChanged),
+          ),
+        ],
+      ),
       PanelSection(
         title: 'Output',
         children: [
@@ -127,6 +168,29 @@ class _StudioPanelState extends State<StudioPanel> {
       ),
     );
     if (ok == true) action();
+  }
+}
+
+/// Horizontal microphone level bar (dBFS-scaled), green → amber → red.
+class _LevelBar extends StatelessWidget {
+  final double level;
+  const _LevelBar({required this.level});
+
+  @override
+  Widget build(BuildContext context) {
+    final db = level <= 0 ? -90.0 : 20 * math.log(level) / math.ln10;
+    final f = ((db + 50) / 50).clamp(0.0, 1.0);
+    final color = db > -6 ? C.tally : (db > -14 ? C.warn : C.ok);
+    return Row(children: [
+      Expanded(
+        child: ClipRRect(
+          borderRadius: BorderRadius.circular(3),
+          child: LinearProgressIndicator(value: f, minHeight: 6, backgroundColor: C.surface3, valueColor: AlwaysStoppedAnimation(color)),
+        ),
+      ),
+      const SizedBox(width: S.sm),
+      SizedBox(width: 52, child: Text(db < -60 ? '—' : '${db.toStringAsFixed(0)} dB', textAlign: TextAlign.right, style: T.hud.copyWith(color: C.textDim))),
+    ]);
   }
 }
 

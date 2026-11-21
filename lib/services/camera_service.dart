@@ -6,6 +6,8 @@ import 'jpeg_encoder.dart';
 import 'h264_encoder_channel.dart';
 import 'cam2_encoder_channel.dart';
 import 'smart_framer.dart';
+import 'frame_analysis.dart';
+import 'storage.dart' show ShotPreset;
 
 /// Owns the camera hardware: preview, live frame capture, zoom, flip and torch.
 ///
@@ -99,6 +101,120 @@ class CameraService extends ChangeNotifier {
   int _lastFramingNotifyMs = 0;
   bool _lastLost = false;
   bool get smartZoomActive => framer.locked;
+
+  // ── Stabiliser + viewfinder aids ─────────────────────────────────────────────
+  final Stabilizer _stab = Stabilizer();
+  final AidsAnalyzer _aids = AidsAnalyzer();
+  bool _stabilizeOn = false;
+  bool zebraOn = false;
+  bool peakingOn = false;
+  int _lastAidsMs = 0;
+  bool get stabilizeOn => _stabilizeOn;
+  /// Zebra / peaking overlay (source orientation RGBA) at ~6 Hz.
+  void Function(Uint8List rgba, int w, int h)? onAids;
+
+  void setStabilize(bool on) {
+    _stabilizeOn = on;
+    _stab.reset();
+    framer.setStabilizerMargin(on);
+    notifyListeners();
+  }
+
+  // ── Saved shots ──────────────────────────────────────────────────────────────
+  /// Snapshot of the current framing as a recallable shot.
+  ShotPreset captureShot(String id, String name) {
+    final locked = framer.locked;
+    return ShotPreset(
+      id: id,
+      name: name,
+      hwZoom: hasHardwareZoom ? _zoom : 1,
+      crop: locked ? framer.zoom : framer.baseZoom,
+      cx: locked ? framer.cx : framer.mx,
+      cy: locked ? framer.cy : framer.my,
+    );
+  }
+
+  /// Glide to a saved shot: lens zoom and crop move together, smoothly.
+  void recallShot(ShotPreset s) {
+    if (framer.locked) {
+      tracker.release();
+      framer.release();
+    }
+    if (hasHardwareZoom) {
+      animateZoomTo(s.hwZoom, durationMs: 900);
+    } else {
+      _zoom = s.crop.clamp(zoomMin, zoomMax).toDouble();
+    }
+    framer.goTo(s.cx, s.cy, s.crop);
+    onSmartZoomChanged?.call();
+    notifyListeners();
+  }
+
+  /// One-finger drag on the viewfinder pans a zoomed (cropped) frame.
+  bool get canPan => !framer.locked && framer.zoom > 1.01;
+  void panBy(double dxOut, double dyOut) {
+    framer.panBy(dxOut, dyOut);
+    framingTick.value++;
+  }
+
+  // ── Backup (ISO) recording on the phone ──────────────────────────────────────
+  bool _isoRecording = false;
+  DateTime? isoStartedAt;
+  bool get isoRecording => _isoRecording;
+  /// Called with the finished file's path (e.g. after a lens switch stops it).
+  void Function(String path)? onIsoFinished;
+
+  /// Record full-quality video on the phone while still streaming.
+  Future<bool> startIsoRecording() async {
+    final c = _controller;
+    if (c == null || !c.value.isInitialized || _isoRecording || _h264Mode) return false;
+    try {
+      if (c.value.isStreamingImages) await c.stopImageStream();
+      // The image stream keeps flowing to the encoder through onAvailable.
+      await c.startVideoRecording(onAvailable: _onCameraImage);
+      _isoRecording = true;
+      isoStartedAt = DateTime.now();
+      notifyListeners();
+      return true;
+    } catch (e) {
+      debugPrint('[CameraService] ISO record failed: $e');
+      try {
+        if (_streaming && !c.value.isStreamingImages) await c.startImageStream(_onCameraImage);
+      } catch (_) {}
+      return false;
+    }
+  }
+
+  Future<String?> stopIsoRecording() async {
+    final c = _controller;
+    if (c == null || !_isoRecording) return null;
+    String? path;
+    try {
+      // Bounded: if the device never produced a video keyframe the recorder
+      // can't finalise, and an unbounded await would leave the switch stuck
+      // "on" forever. Give up cleanly instead.
+      final f = await c.stopVideoRecording().timeout(const Duration(seconds: 6));
+      path = f.path;
+    } catch (e) {
+      debugPrint('[CameraService] ISO stop failed: $e');
+    }
+    _isoRecording = false;
+    isoStartedAt = null;
+    try {
+      if (_streaming && !c.value.isStreamingImages) await c.startImageStream(_onCameraImage);
+    } catch (_) {}
+    notifyListeners();
+    return path;
+  }
+
+  /// Capture resolution for the MJPEG path, from the user's quality setting.
+  /// Capped at 1080p: output is ≤1024 wide anyway, the extra resolution is
+  /// there so digital zoom / Smart Zoom crops stay sharp.
+  void setCaptureLongEdge(int longEdge) {
+    _preset = longEdge >= 1920 ? ResolutionPreset.veryHigh
+        : longEdge >= 1280 ? ResolutionPreset.high
+        : ResolutionPreset.medium;
+  }
 
   bool _torchOn = false;
   // AE/AF lock state — when locked the camera holds the current focus/exposure
@@ -562,6 +678,8 @@ class CameraService extends ChangeNotifier {
   //          which is also what the phone preview and desktop show.
   // The encoder mirrors first, then rotates clockwise by _computeRotation().
   bool get _mirrorOut => lensDirection == CameraLensDirection.front;
+  /// Rotation the encoder applies (source → output), for UI overlays.
+  int get outRotation => _computeRotation();
 
   Offset srcToOut(Offset p) {
     var x = p.dx, y = p.dy;
@@ -662,6 +780,25 @@ class CameraService extends ChangeNotifier {
       }
     }
 
+    // Stabiliser: measure shake every frame, convert the source-space
+    // correction into output space for the crop.
+    if (_stabilizeOn && yuv) {
+      final p = image.planes[0];
+      _stab.update(p.bytes, image.width, image.height, p.bytesPerRow);
+      final o = srcToOut(const Offset(0.5, 0.5));
+      final c = srcToOut(Offset(0.5 + _stab.corrX, 0.5 + _stab.corrY));
+      framer.stabX = c.dx - o.dx;
+      framer.stabY = c.dy - o.dy;
+    }
+
+    // Zebra / focus peaking for the operator's viewfinder, ~6 Hz.
+    if ((zebraOn || peakingOn) && yuv && onAids != null && nowMs - _lastAidsMs >= 160) {
+      _lastAidsMs = nowMs;
+      final p = image.planes[0];
+      final r = _aids.build(p.bytes, image.width, image.height, p.bytesPerRow, zebra: zebraOn, peaking: peakingOn);
+      if (r != null) onAids!(r.$1, r.$2, r.$3);
+    }
+
     final wasIdentity = framer.isIdentity;
     framer.tick(dt);
     // Repaint the on-phone framing overlay at ~20 Hz while anything moves.
@@ -686,21 +823,43 @@ class CameraService extends ChangeNotifier {
     }
     if (image.format.group == ImageFormatGroup.yuv420) {
       if (image.planes.length < 3) return null;
+      // When cropped, hand the isolate only the rows it will read — at 1080p
+      // capture a 2× crop halves the bytes copied per frame.
+      var y = image.planes[0].bytes, u = image.planes[1].bytes, v = image.planes[2].bytes;
+      var h = image.height;
+      var cropY = crop.top, cropH = crop.height;
+      if (cropH < 0.98) {
+        final yStride = image.planes[0].bytesPerRow, uvStride = image.planes[1].bytesPerRow;
+        final y0 = ((crop.top * image.height).floor() & ~1).clamp(0, image.height - 2);
+        var y1 = (crop.bottom * image.height).ceil();
+        y1 = ((y1 + 1) & ~1).clamp(y0 + 2, image.height);
+        final ys = (y0 * yStride).clamp(0, y.length), ye = (y1 * yStride).clamp(0, y.length);
+        final cs = ((y0 >> 1) * uvStride).clamp(0, u.length);
+        final ceU = ((y1 >> 1) * uvStride).clamp(0, u.length), ceV = ((y1 >> 1) * uvStride).clamp(0, v.length);
+        if (ye > ys && ceU > cs && ceV > cs) {
+          y = Uint8List.sublistView(y, ys, ye);
+          u = Uint8List.sublistView(u, cs, ceU);
+          v = Uint8List.sublistView(v, cs, ceV);
+          h = y1 - y0;
+          cropY = ((crop.top * image.height - y0) / h).clamp(0.0, 1.0);
+          cropH = (crop.height * image.height / h).clamp(0.0, 1.0 - cropY);
+        }
+      }
       return RawFrame(
         format: 0,
         width: image.width,
-        height: image.height,
+        height: h,
         maxWidth: _maxOutWidth,
         quality: _jpegQuality,
         mirror: mirror,
         rotation: rot,
         cropX: crop.left,
-        cropY: crop.top,
+        cropY: cropY,
         cropW: crop.width,
-        cropH: crop.height,
-        y: image.planes[0].bytes,
-        u: image.planes[1].bytes,
-        v: image.planes[2].bytes,
+        cropH: cropH,
+        y: y,
+        u: u,
+        v: v,
         yRowStride: image.planes[0].bytesPerRow,
         uvRowStride: image.planes[1].bytesPerRow,
         uvPixelStride: image.planes[1].bytesPerPixel ?? 1,
@@ -798,6 +957,10 @@ class CameraService extends ChangeNotifier {
     _zoom = 1.0;
     _torchOn = false;
     smartRelease();
+    _stab.reset();
+    // A lens switch re-opens the camera, which would cut a backup recording
+    // off unsaved — finish it properly first.
+    if (_isoRecording) { final p = await stopIsoRecording(); if (p != null) onIsoFinished?.call(p); }
     await _startController();
   }
 
@@ -885,6 +1048,8 @@ class CameraService extends ChangeNotifier {
     _zoom = 1.0;
     _torchOn = false;
     smartRelease();
+    _stab.reset();
+    if (_isoRecording) { final p = await stopIsoRecording(); if (p != null) onIsoFinished?.call(p); }
     await _startController();
     return true;
   }

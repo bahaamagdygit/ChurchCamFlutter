@@ -1,11 +1,14 @@
 import 'dart:async';
 import 'dart:math' as math;
+import 'dart:ui' as ui;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:camera/camera.dart';
 import 'package:phosphor_flutter/phosphor_flutter.dart';
 import 'package:provider/provider.dart';
 import 'package:wakelock_plus/wakelock_plus.dart';
+import 'package:sensors_plus/sensors_plus.dart';
+import 'package:gal/gal.dart';
 import '../services/connection_service.dart';
 import '../services/camera_service.dart';
 import '../services/abr_controller.dart';
@@ -13,6 +16,7 @@ import '../services/device_status_service.dart';
 import '../services/orientation_service.dart';
 import '../services/storage.dart';
 import '../services/smart_framer.dart';
+import '../services/audio_service.dart';
 import '../models/camera_filters.dart';
 import '../utils/permissions.dart';
 import '../widgets/metrics_overlay.dart';
@@ -65,6 +69,28 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
   AbrController? _abr;
   bool _showMetrics = false;
 
+  // Persisted settings (viewfinder aids, stabiliser, audio, codec).
+  AppSettings _settings = const AppSettings();
+
+  // Microphone → desktop.
+  final AudioService _audio = AudioService();
+
+  // Saved shots (camera presets).
+  List<ShotPreset> _shots = [];
+  String? _activeShotId;
+
+  // Zebra / peaking overlay image (source orientation) + horizon level.
+  final ValueNotifier<ui.Image?> _aidsImage = ValueNotifier<ui.Image?>(null);
+  final ValueNotifier<double> _tilt = ValueNotifier<double>(0);
+  StreamSubscription? _accelSub;
+
+  // Director → camera operator message currently shown.
+  String? _directorMsg;
+  Timer? _directorTimer;
+
+  // Backup-recording timer tick for the HUD.
+  Timer? _isoTicker;
+
   @override
   void initState() {
     super.initState();
@@ -91,12 +117,29 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
       setState(() { _permissionDenied = true; _initializing = false; });
       return;
     }
+    // Settings first: the capture resolution must be chosen before the camera
+    // opens (re-opening mid-stream causes a reconnect storm).
+    _settings = await loadSettings();
+    _shots = await loadShots();
+    _camera.setCaptureLongEdge(_settings.videoLongEdge);
+
     final ok = await _camera.initialize();
     if (!mounted) return;
     if (!ok) {
       setState(() { _initError = 'No camera available on this device.'; _initializing = false; });
       return;
     }
+
+    // Viewfinder aids, stabiliser, horizon level, microphone, backup recording.
+    _camera.zebraOn = _settings.zebraOn;
+    _camera.peakingOn = _settings.peakingOn;
+    _camera.onAids = _onAids;
+    if (_settings.stabilize) _camera.setStabilize(true);
+    if (_settings.levelOn) _startLevel();
+    _audio.onPcm = (pcm) => _conn?.sendAudio(pcm);
+    _audio.addListener(_onAudioLevel);
+    if (_settings.audioEnabled) _setAudio(true, persist: false);
+    _camera.onIsoFinished = _saveIsoToGallery;
 
     // Restore last filters for this camera.
     _filters = await loadFilters(_camera.lensDirection.name);
@@ -188,7 +231,190 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
       'zoomMax': _camera.maxZoom,
       'hardwareZoom': _camera.hasHardwareZoom,
       'smartZoom': _camera.smartZoomState(),
+      'shots': _shots.map((s) => {'id': s.id, 'name': s.name}).toList(),
+      'activeShot': _activeShotId,
+      'isoRecording': _camera.isoRecording,
+      'audio': _audio.running,
+      'stabilize': _camera.stabilizeOn,
     });
+  }
+
+  // ── Settings persistence ────────────────────────────────────────────────────
+  Future<void> _updateSettings(AppSettings s) async {
+    setState(() => _settings = s);
+    await saveSettings(s);
+  }
+
+  // ── Saved shots ─────────────────────────────────────────────────────────────
+  Future<void> _saveShot(String name, {String? replaceId}) async {
+    final id = replaceId ?? 'shot_${DateTime.now().millisecondsSinceEpoch}';
+    final shot = _camera.captureShot(id, name);
+    final list = [..._shots];
+    final i = list.indexWhere((s) => s.id == id);
+    if (i >= 0) { list[i] = shot; } else { list.add(shot); }
+    setState(() { _shots = list; _activeShotId = id; });
+    await saveShots(list);
+    _reportPhoneState();
+  }
+
+  void _recallShot(ShotPreset s) {
+    HapticFeedback.selectionClick();
+    _camera.recallShot(s);
+    setState(() { _activeShotId = s.id; _smartMode = false; });
+    _reportPhoneState();
+  }
+
+  Future<void> _deleteShot(String id) async {
+    final list = _shots.where((s) => s.id != id).toList();
+    setState(() { _shots = list; if (_activeShotId == id) _activeShotId = null; });
+    await saveShots(list);
+    _reportPhoneState();
+  }
+
+  Future<void> _renameShot(String id, String name) async {
+    final list = _shots.map((s) => s.id == id ? s.renamed(name) : s).toList();
+    setState(() => _shots = list);
+    await saveShots(list);
+    _reportPhoneState();
+  }
+
+  // ── Microphone ──────────────────────────────────────────────────────────────
+  Future<void> _setAudio(bool on, {bool persist = true}) async {
+    if (on) {
+      final ok = await _audio.start();
+      if (!ok && mounted) _toast('Microphone unavailable — check the permission in Android settings.');
+    } else {
+      await _audio.stop();
+    }
+    if (persist) await _updateSettings(_settings.copyWith(audioEnabled: _audio.running));
+    if (mounted) setState(() {});
+    _reportPhoneState();
+  }
+
+  void _onAudioLevel() { if (mounted && (_tab == _Tab.studio)) setState(() {}); }
+
+  // ── Viewfinder aids ─────────────────────────────────────────────────────────
+  void _onAids(Uint8List rgba, int w, int h) {
+    ui.decodeImageFromPixels(rgba, w, h, ui.PixelFormat.rgba8888, (img) {
+      if (!mounted) { img.dispose(); return; }
+      final old = _aidsImage.value;
+      _aidsImage.value = img;
+      old?.dispose();
+    });
+  }
+
+  Future<void> _setAids({bool? zebra, bool? peaking}) async {
+    final s = _settings.copyWith(zebraOn: zebra, peakingOn: peaking);
+    _camera.zebraOn = s.zebraOn;
+    _camera.peakingOn = s.peakingOn;
+    if (!s.zebraOn && !s.peakingOn) {
+      final old = _aidsImage.value;
+      _aidsImage.value = null;
+      old?.dispose();
+    }
+    await _updateSettings(s);
+  }
+
+  void _startLevel() {
+    _accelSub ??= accelerometerEventStream(samplingPeriod: SensorInterval.uiInterval).listen((e) {
+      // Landscape: gravity lies along the device's x axis. The roll is the
+      // angle of gravity off that axis; the sign follows which way up the
+      // phone is held.
+      final t = e.x >= 0 ? math.atan2(e.y, e.x) : math.atan2(-e.y, -e.x);
+      _tilt.value = _tilt.value * 0.7 + t * 0.3; // smooth out sensor noise
+    });
+  }
+
+  void _stopLevel() {
+    _accelSub?.cancel();
+    _accelSub = null;
+  }
+
+  Future<void> _setLevel(bool on) async {
+    on ? _startLevel() : _stopLevel();
+    await _updateSettings(_settings.copyWith(levelOn: on));
+  }
+
+  Future<void> _setStabilize(bool on) async {
+    _camera.setStabilize(on);
+    await _updateSettings(_settings.copyWith(stabilize: on));
+    _reportPhoneState();
+  }
+
+  // ── Backup (ISO) recording ──────────────────────────────────────────────────
+  bool _isoBusy = false;
+  Future<void> _setIso(bool on) async {
+    // Starting/stopping a recording takes a moment; a second tap (or a desktop
+    // command) arriving meanwhile must not start a second, conflicting one.
+    if (_isoBusy) return;
+    _isoBusy = true;
+    try { await _setIsoInner(on); } finally { _isoBusy = false; }
+  }
+
+  Future<void> _setIsoInner(bool on) async {
+    if (on == _camera.isoRecording) return;
+    if (on) {
+      final ok = await _camera.startIsoRecording();
+      if (!ok) {
+        _toast(_camera.isH264Mode
+            ? 'Backup recording isn\'t available in H.264 mode.'
+            : 'This phone couldn\'t start a recording alongside the stream.');
+      } else {
+        HapticFeedback.mediumImpact();
+        _isoTicker?.cancel();
+        _isoTicker = Timer.periodic(const Duration(seconds: 1), (_) { if (mounted) setState(() {}); });
+      }
+    } else {
+      _isoTicker?.cancel();
+      _isoTicker = null;
+      final path = await _camera.stopIsoRecording();
+      if (path != null) {
+        await _saveIsoToGallery(path);
+      } else {
+        _toast('This phone couldn\'t finish the backup recording — it may not support recording while streaming.');
+      }
+    }
+    if (mounted) setState(() {});
+    _reportPhoneState();
+  }
+
+  Future<void> _saveIsoToGallery(String path) async {
+    try {
+      if (!await Gal.hasPermission(toAlbum: true)) await Gal.requestPermission(toAlbum: true);
+      await Gal.putVideo(path, album: 'Church Cam');
+      _toast('Backup recording saved to Gallery › Church Cam');
+    } catch (e) {
+      _toast('Couldn\'t save the recording to the gallery ($e).');
+    }
+  }
+
+  String _isoElapsed() {
+    final t = _camera.isoStartedAt;
+    if (t == null) return '';
+    final d = DateTime.now().difference(t);
+    final m = d.inMinutes.remainder(60).toString().padLeft(2, '0');
+    final s = d.inSeconds.remainder(60).toString().padLeft(2, '0');
+    return d.inHours > 0 ? '${d.inHours}:$m:$s' : '$m:$s';
+  }
+
+  // ── Director messages ───────────────────────────────────────────────────────
+  void _showDirectorMessage(String text) {
+    HapticFeedback.heavyImpact();
+    Future.delayed(const Duration(milliseconds: 180), HapticFeedback.heavyImpact);
+    setState(() => _directorMsg = text);
+    _directorTimer?.cancel();
+    _directorTimer = Timer(const Duration(seconds: 10), () { if (mounted) setState(() => _directorMsg = null); });
+  }
+
+  void _replyDirector(String text) {
+    _conn?.sendDirectorReply(text);
+    _directorTimer?.cancel();
+    setState(() => _directorMsg = null);
+  }
+
+  void _toast(String msg) {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(msg), duration: const Duration(seconds: 3)));
   }
 
   // ALWAYS LANDSCAPE: the app is locked to landscape, so the feed is always
@@ -362,6 +588,37 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
           conn?.confirmControl('filters', _filters.toJson());
         }
         break;
+      // ── Saved shots, driven from the desktop ──
+      case 'shot_recall':
+        if (cmd.value is Map) {
+          final id = (cmd.value as Map)['id']?.toString();
+          final s = _shots.where((x) => x.id == id).firstOrNull;
+          if (s != null) _recallShot(s);
+        }
+        break;
+      case 'shot_save':
+        if (cmd.value is Map) {
+          final name = ((cmd.value as Map)['name'] ?? '').toString().trim();
+          await _saveShot(name.isEmpty ? 'Shot ${_shots.length + 1}' : name);
+        }
+        break;
+      case 'shot_delete':
+        if (cmd.value is Map) await _deleteShot(((cmd.value as Map)['id'] ?? '').toString());
+        break;
+      // ── Director ──
+      case 'director_msg':
+        final text = cmd.value is Map ? ((cmd.value as Map)['text'] ?? '').toString() : (cmd.value ?? '').toString();
+        if (text.trim().isNotEmpty) _showDirectorMessage(text.trim());
+        break;
+      case 'iso_record':
+        await _setIso(cmd.value == true || (cmd.value is Map && (cmd.value as Map)['on'] == true));
+        break;
+      case 'audio_enable':
+        await _setAudio(cmd.value == true || (cmd.value is Map && (cmd.value as Map)['on'] == true));
+        break;
+      case 'stabilize':
+        await _setStabilize(cmd.value == true || (cmd.value is Map && (cmd.value as Map)['on'] == true));
+        break;
       case 'desktop_state':
         // Informational (camera list, tally, transition) — ConnectionService
         // already stored it and the UI listens there. Not a command.
@@ -387,11 +644,14 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
   // USB webcam instead of this phone. Now we only REPORT the value.
   Future<void> _applyZoom(double z) async {
     await _camera.setZoom(z);
+    // The framing no longer matches a saved shot.
+    if (_activeShotId != null && mounted) setState(() => _activeShotId = null);
     _showZoomIndicator();
     _reportPhoneState();
   }
 
   void _animateZoom(double z) {
+    if (_activeShotId != null) setState(() => _activeShotId = null);
     _camera.animateZoomTo(z);
     _showZoomIndicator();
     Future.delayed(const Duration(milliseconds: 700), _reportPhoneState);
@@ -469,6 +729,20 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
     _zoomBarTimer?.cancel();
     _stateReportTimer?.cancel();
     _camera.onSmartZoomChanged = null;
+    _camera.onAids = null;
+    _camera.onIsoFinished = null;
+    _directorTimer?.cancel();
+    _isoTicker?.cancel();
+    _stopLevel();
+    _audio.removeListener(_onAudioLevel);
+    _audio.dispose();
+    _aidsImage.value?.dispose();
+    _aidsImage.dispose();
+    _tilt.dispose();
+    // A recording in progress must not be lost when the screen closes.
+    if (_camera.isoRecording) {
+      _camera.stopIsoRecording().then((p) { if (p != null) Gal.putVideo(p, album: 'Church Cam').catchError((_) {}); });
+    }
     _deviceStatus.dispose();
     _abr?.dispose();
     _conn?.removeCommandListener(_onRemoteCommand);
@@ -519,8 +793,17 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
             behavior: HitTestBehavior.opaque,
             onScaleStart: (_) => _baseZoom = _camera.zoom,
             onScaleUpdate: (d) {
-              if (d.pointerCount >= 2 && (d.scale - 1.0).abs() > 0.01) _applyZoom(_baseZoom * d.scale);
+              if (d.pointerCount >= 2 && (d.scale - 1.0).abs() > 0.01) {
+                _applyZoom(_baseZoom * d.scale);
+              } else if (d.pointerCount == 1 && _camera.canPan && !panelOpen) {
+                // One finger on a zoomed picture = move the frame, like
+                // dragging a photo. Shot no longer matches a saved one.
+                final fr = _frameRectOnScreen(size);
+                _camera.panBy(d.focalPointDelta.dx / fr.width, d.focalPointDelta.dy / fr.height);
+                if (_activeShotId != null) setState(() => _activeShotId = null);
+              }
             },
+            onScaleEnd: (_) => _reportPhoneState(),
             onTapDown: (d) {
               if (panelOpen) { setState(() => _tab = null); return; }
               _smartMode ? _smartTap(d, size) : _tapFocus(d, size);
@@ -539,6 +822,33 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
             ),
           ),
 
+          // Zebra / focus peaking (viewfinder only — never in the stream).
+          if (_settings.zebraOn || _settings.peakingOn)
+            IgnorePointer(
+              child: ValueListenableBuilder<ui.Image?>(
+                valueListenable: _aidsImage,
+                builder: (_, img, __) => img == null
+                    ? const SizedBox.shrink()
+                    : CustomPaint(size: size, painter: _AidsPainter(
+                        image: img,
+                        frameRect: _frameRectOnScreen(size),
+                        rotation: _camera.outRotation,
+                        mirror: _camera.lensDirection == CameraLensDirection.front,
+                      )),
+              ),
+            ),
+
+          // Rule-of-thirds grid + horizon level.
+          if (_settings.gridOn)
+            IgnorePointer(child: CustomPaint(size: size, painter: _GridPainter(_camera, _frameRectOnScreen(size)))),
+          if (_settings.levelOn)
+            IgnorePointer(
+              child: ValueListenableBuilder<double>(
+                valueListenable: _tilt,
+                builder: (_, t, __) => CustomPaint(size: size, painter: _LevelPainter(t)),
+              ),
+            ),
+
           if (_focusPoint != null)
             Positioned(
               left: _focusPoint!.dx * size.width - 36,
@@ -551,8 +861,12 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
             builder: (_, conn, __) => IgnorePointer(
               child: AnimatedContainer(
                 duration: const Duration(milliseconds: 200),
+                // Red = on air; green = the director has cued this camera next.
                 decoration: BoxDecoration(
-                  border: Border.all(color: conn.isSelfLive ? C.tally : Colors.transparent, width: 3),
+                  border: Border.all(
+                    color: conn.isSelfLive ? C.tally : (conn.isSelfCued ? C.ok : Colors.transparent),
+                    width: 3,
+                  ),
                 ),
               ),
             ),
@@ -601,6 +915,13 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
                     ))),
                   ),
           ),
+
+          // Director's message — big, unmissable, with one-tap replies.
+          if (_directorMsg != null)
+            Positioned(
+              top: 56, left: contentLeft + S.md, right: 84,
+              child: Center(child: _buildDirectorBanner(_directorMsg!)),
+            ),
 
           if (_smartMode && !_camera.smartZoomActive)
             Positioned(
@@ -691,8 +1012,8 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
             onTap: () { HapticFeedback.selectionClick(); _openTab(t); },
             child: AnimatedContainer(
               duration: const Duration(milliseconds: 160),
-              width: 52, height: 52,
-              margin: const EdgeInsets.symmetric(vertical: 4),
+              width: 48, height: 48, // 6 tabs must fit a ~400dp landscape height
+              margin: const EdgeInsets.symmetric(vertical: 2),
               decoration: BoxDecoration(
                 color: on ? C.accent : Colors.transparent,
                 borderRadius: BorderRadius.circular(R.md),
@@ -735,6 +1056,7 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
               padding: const EdgeInsets.symmetric(vertical: S.sm),
               child: Column(children: [
                 tab(_Tab.live, PhosphorIconsRegular.broadcast, PhosphorIconsFill.broadcast, 'Live cameras'),
+                tab(_Tab.shots, PhosphorIconsRegular.bookmarksSimple, PhosphorIconsFill.bookmarksSimple, 'Saved shots'),
                 tab(_Tab.smart, PhosphorIconsRegular.userFocus, PhosphorIconsFill.userFocus, 'Smart Zoom'),
                 tab(_Tab.image, PhosphorIconsRegular.faders, PhosphorIconsFill.faders, 'Image & filters'),
                 tab(_Tab.studio, PhosphorIconsRegular.projectorScreen, PhosphorIconsFill.projectorScreen, 'Studio control'),
@@ -771,9 +1093,16 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
       final batColor = _deviceStatus.charging ? C.ok : (bp >= 0 && bp <= 15 ? C.tally : (bp >= 0 && bp <= 30 ? C.warn : C.text));
 
       final live = conn.isSelfLive;
+      final cued = conn.isSelfCued;
+      final tallyColor = live ? C.tally : (cued ? C.ok : null);
       final lost = _camera.smartZoomActive && _camera.tracker.lost;
 
       return Row(children: [
+        // Left side: status chips. Clipped to their share of the bar so extra
+        // chips (mic, REC) can never push the tally off screen.
+        Expanded(child: ClipRect(child: SingleChildScrollView(
+          scrollDirection: Axis.horizontal, physics: const NeverScrollableScrollPhysics(),
+          child: Row(children: [
         GestureDetector(
           onTap: () => setState(() => _showMetrics = !_showMetrics),
           child: Semantics(
@@ -795,22 +1124,48 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
           PhosphorIcon(batIcon, size: 18, color: batColor),
           if (bp >= 0) ...[const SizedBox(width: 4), Text('$bp%', style: T.hud.copyWith(color: batColor))],
         ])),
-        const Spacer(),
+        // Live microphone meter while the phone's audio is sent.
+        if (_audio.running) ...[
+          const SizedBox(width: S.sm),
+          AnimatedBuilder(
+            animation: _audio,
+            builder: (_, __) => HudChip(child: Row(children: [
+              PhosphorIcon(PhosphorIconsFill.microphone, size: 15, color: C.ok),
+              const SizedBox(width: 6),
+              _MiniMeter(level: _audio.level),
+            ])),
+          ),
+        ],
+        // Backup recording on the phone.
+        if (_camera.isoRecording) ...[
+          const SizedBox(width: S.sm),
+          HudChip(
+            borderColor: C.tally,
+            child: Row(children: [
+              Container(width: 8, height: 8, decoration: const BoxDecoration(color: C.tally, shape: BoxShape.circle)),
+              const SizedBox(width: 6),
+              Text('REC ${_isoElapsed()}', style: T.hud.copyWith(color: C.tally)),
+            ]),
+          ),
+        ],
+        ])))),
+        const SizedBox(width: S.sm),
         // Tally — the one thing an operator must read from across the room.
         AnimatedContainer(
           duration: const Duration(milliseconds: 200),
           height: 32,
           padding: const EdgeInsets.symmetric(horizontal: 14),
           decoration: BoxDecoration(
-            color: live ? C.tally : C.scrim,
+            color: tallyColor ?? C.scrim,
             borderRadius: BorderRadius.circular(R.sm),
-            border: Border.all(color: live ? C.tally : C.hairline),
+            border: Border.all(color: tallyColor ?? C.hairline),
           ),
           child: Row(mainAxisSize: MainAxisSize.min, children: [
-            PhosphorIcon(live ? PhosphorIconsFill.record : PhosphorIconsRegular.record, size: 14, color: live ? Colors.white : C.textDim),
+            PhosphorIcon(tallyColor != null ? PhosphorIconsFill.record : PhosphorIconsRegular.record, size: 14,
+                color: live ? Colors.white : (cued ? C.accentInk : C.textDim)),
             const SizedBox(width: 6),
-            Text(live ? 'ON AIR' : 'STANDBY',
-                style: T.hud.copyWith(color: live ? Colors.white : C.textDim, letterSpacing: 1.4, fontWeight: FontWeight.w900)),
+            Text(live ? 'ON AIR' : (cued ? 'NEXT' : 'STANDBY'),
+                style: T.hud.copyWith(color: live ? Colors.white : (cued ? C.accentInk : C.textDim), letterSpacing: 1.4, fontWeight: FontWeight.w900)),
           ]),
         ),
         if (lost) ...[
@@ -824,7 +1179,11 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
             ]),
           ),
         ],
-        const Spacer(),
+        const SizedBox(width: S.sm),
+        // Right side: secondary info, right-aligned and clipped (never overflows).
+        Expanded(child: ClipRect(child: SingleChildScrollView(
+          scrollDirection: Axis.horizontal, reverse: true, physics: const NeverScrollableScrollPhysics(),
+          child: Row(children: [
         // Secondary info — dropped while a panel narrows the viewfinder, so the
         // link, battery and tally never get pushed off screen.
         if (_tab == null) ...[
@@ -834,6 +1193,7 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
           )),
           const SizedBox(width: 64), // keep clear of the tool rail column
         ],
+        ])))),
       ]);
     });
   }
@@ -965,14 +1325,25 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
     switch (t) {
       case _Tab.live:
         icon = PhosphorIconsFill.broadcast; title = 'Live cameras'; body = _livePanel();
+      case _Tab.shots:
+        icon = PhosphorIconsFill.bookmarksSimple; title = 'Saved shots'; body = _shotsPanel();
       case _Tab.smart:
         icon = PhosphorIconsFill.userFocus; title = 'Smart Zoom'; body = _smartPanel();
       case _Tab.image:
         icon = PhosphorIconsFill.faders; title = 'Image'; body = _imagePanel();
       case _Tab.studio:
-        icon = PhosphorIconsFill.projectorScreen; title = 'Studio'; body = const StudioPanel();
+        icon = PhosphorIconsFill.projectorScreen; title = 'Studio';
+        body = StudioPanel(
+          audioOn: _audio.running,
+          audioLevel: _audio.level,
+          onAudioChanged: (v) => _setAudio(v),
+          isoRecording: _camera.isoRecording,
+          isoElapsed: _isoElapsed(),
+          onIsoChanged: (v) => _setIso(v),
+        );
       case _Tab.settings:
-        icon = PhosphorIconsFill.gearSix; title = 'Settings'; body = SettingsPanel(onDisconnect: _disconnect);
+        icon = PhosphorIconsFill.gearSix; title = 'Settings';
+        body = SettingsPanel(onDisconnect: _disconnect, onSettingsChanged: (s) => setState(() => _settings = s));
       case null:
         icon = PhosphorIconsFill.aperture; title = '';
     }
@@ -1063,6 +1434,154 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
       ]);
     });
   }
+
+  // Saved shots: one tap to glide to a framing; long-press to manage.
+  Widget _shotsPanel() {
+    String sub(ShotPreset s) {
+      final parts = <String>[];
+      if (s.hwZoom > 1.01) parts.add('${s.hwZoom.toStringAsFixed(1)}× lens');
+      if (s.crop > 1.01) parts.add('${s.crop.toStringAsFixed(1)}× frame');
+      return parts.isEmpty ? 'Full picture' : parts.join(' · ');
+    }
+
+    return Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+      SizedBox(
+        width: double.infinity,
+        height: 52,
+        child: FilledButton.icon(
+          style: FilledButton.styleFrom(shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(R.md))),
+          onPressed: _promptSaveShot,
+          icon: PhosphorIcon(PhosphorIconsBold.bookmarkSimple, size: 18, color: C.accentInk),
+          label: const Text('Save current framing', style: TextStyle(fontWeight: FontWeight.w800)),
+        ),
+      ),
+      const SizedBox(height: S.sm),
+      const Text('Zoom, then drag the picture with one finger to frame it. Save it, and recall it any time with one tap — from here or from the desktop.', style: T.body),
+      const SizedBox(height: S.lg),
+      if (_shots.isEmpty)
+        Container(
+          width: double.infinity,
+          padding: const EdgeInsets.all(S.lg),
+          decoration: BoxDecoration(color: C.surface2, borderRadius: BorderRadius.circular(R.md), border: Border.all(color: C.border)),
+          child: Column(children: [
+            PhosphorIcon(PhosphorIconsRegular.bookmarksSimple, size: 28, color: C.textFaint),
+            const SizedBox(height: S.sm),
+            const Text('No saved shots yet', style: T.label),
+            const SizedBox(height: 2),
+            const Text('e.g. Altar, Pulpit, Choir, Wide', style: T.caption),
+          ]),
+        )
+      else
+        PanelSection(
+          title: 'Shots  (${_shots.length})',
+          children: _shots.map((s) => GestureDetector(
+                onLongPress: () => _shotMenu(s),
+                child: PanelTile(
+                  icon: PhosphorIconsRegular.frameCorners,
+                  title: s.name,
+                  subtitle: sub(s),
+                  highlighted: _activeShotId == s.id,
+                  trailing: _activeShotId == s.id
+                      ? PhosphorIcon(PhosphorIconsFill.checkCircle, size: 20, color: C.accent)
+                      : PhosphorIcon(PhosphorIconsBold.play, size: 16, color: C.textFaint),
+                  onTap: () => _recallShot(s),
+                ),
+              )).toList(),
+        ),
+      if (_shots.isNotEmpty) const Text('Long-press a shot to rename, update or delete it.', style: T.caption),
+    ]);
+  }
+
+  Future<void> _promptSaveShot({ShotPreset? replace}) async {
+    final ctrl = TextEditingController(text: replace?.name ?? '');
+    const suggestions = ['المذبح', 'المنبر', 'الخورس', 'الشعب', 'لقطة واسعة'];
+    final name = await showDialog<String>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: Text(replace == null ? 'Save shot' : 'Rename shot', style: T.title),
+        content: SingleChildScrollView(child: SizedBox(width: 360, child: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.start, children: [
+          TextField(controller: ctrl, autofocus: true, style: const TextStyle(color: C.text), decoration: const InputDecoration(labelText: 'Name')),
+          const SizedBox(height: S.md),
+          Wrap(spacing: S.sm, runSpacing: S.sm, children: suggestions.map((n) => Choice(
+                label: n, selected: false, onTap: () => Navigator.pop(ctx, n),
+              )).toList()),
+        ]))),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Cancel')),
+          FilledButton(onPressed: () => Navigator.pop(ctx, ctrl.text.trim()), child: const Text('Save')),
+        ],
+      ),
+    );
+    if (name == null) return;
+    final n = name.isEmpty ? 'Shot ${_shots.length + 1}' : name;
+    if (replace != null) {
+      await _renameShot(replace.id, n);
+    } else {
+      await _saveShot(n);
+      _toast('Saved "$n"');
+    }
+  }
+
+  void _shotMenu(ShotPreset s) {
+    HapticFeedback.mediumImpact();
+    showModalBottomSheet(
+      context: context,
+      backgroundColor: C.surface,
+      showDragHandle: true,
+      builder: (ctx) => SafeArea(child: Column(mainAxisSize: MainAxisSize.min, children: [
+        ListTile(
+          leading: PhosphorIcon(PhosphorIconsRegular.pencilSimple, color: C.text),
+          title: const Text('Rename'),
+          onTap: () { Navigator.pop(ctx); _promptSaveShot(replace: s); },
+        ),
+        ListTile(
+          leading: PhosphorIcon(PhosphorIconsRegular.arrowsClockwise, color: C.text),
+          title: const Text('Update to current framing'),
+          onTap: () { Navigator.pop(ctx); _saveShot(s.name, replaceId: s.id); _toast('Updated "${s.name}"'); },
+        ),
+        ListTile(
+          leading: PhosphorIcon(PhosphorIconsRegular.trash, color: C.tally),
+          title: const Text('Delete', style: TextStyle(color: C.tally)),
+          onTap: () { Navigator.pop(ctx); _deleteShot(s.id); },
+        ),
+      ])),
+    );
+  }
+
+  Widget _buildDirectorBanner(String text) => Material(
+        color: Colors.transparent,
+        child: Container(
+          constraints: const BoxConstraints(maxWidth: 560),
+          padding: const EdgeInsets.fromLTRB(S.lg, S.md, S.sm, S.md),
+          decoration: BoxDecoration(
+            color: const Color(0xF0151518),
+            borderRadius: BorderRadius.circular(R.lg),
+            border: Border.all(color: C.warn, width: 2),
+          ),
+          child: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.start, children: [
+            Row(children: [
+              PhosphorIcon(PhosphorIconsFill.megaphone, size: 18, color: C.warn),
+              const SizedBox(width: S.sm),
+              Text('DIRECTOR', style: T.overline.copyWith(color: C.warn)),
+              const Spacer(),
+              Semantics(
+                button: true, label: 'Dismiss',
+                child: IconButton(
+                  visualDensity: VisualDensity.compact,
+                  onPressed: () => setState(() => _directorMsg = null),
+                  icon: PhosphorIcon(PhosphorIconsBold.x, size: 16, color: C.textDim),
+                ),
+              ),
+            ]),
+            Text(text, style: const TextStyle(color: C.text, fontSize: 22, fontWeight: FontWeight.w800, height: 1.25)),
+            const SizedBox(height: S.md),
+            Wrap(spacing: S.sm, children: [
+              Choice(label: 'تمام', icon: PhosphorIconsBold.check, selected: true, selectedColor: C.ok, onTap: () => _replyDirector('تمام 👍')),
+              Choice(label: 'ثواني', icon: PhosphorIconsBold.hourglassMedium, selected: false, onTap: () => _replyDirector('ثواني ✋')),
+            ]),
+          ]),
+        ),
+      );
 
   String _kindLabel(String kind) => switch (kind) {
         'ip' => 'IP camera',
@@ -1163,6 +1682,47 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
         ],
       ),
       PanelSection(
+        title: 'Viewfinder aids',
+        trailing: const Text('Phone only', style: T.caption),
+        children: [
+          PanelTile(
+            icon: PhosphorIconsRegular.gridFour, title: 'Grid',
+            subtitle: 'Rule-of-thirds guides',
+            highlighted: _settings.gridOn,
+            trailing: Switch(value: _settings.gridOn, onChanged: (v) => _updateSettings(_settings.copyWith(gridOn: v))),
+          ),
+          PanelTile(
+            icon: PhosphorIconsRegular.ruler, title: 'Horizon level',
+            subtitle: 'Turns green when the phone is level',
+            highlighted: _settings.levelOn,
+            trailing: Switch(value: _settings.levelOn, onChanged: _setLevel),
+          ),
+          PanelTile(
+            icon: PhosphorIconsRegular.barricade, title: 'Zebra',
+            subtitle: 'Red stripes on over-exposed areas',
+            highlighted: _settings.zebraOn,
+            trailing: Switch(value: _settings.zebraOn, onChanged: (v) => _setAids(zebra: v)),
+          ),
+          PanelTile(
+            icon: PhosphorIconsRegular.crosshairSimple, title: 'Focus peaking',
+            subtitle: 'Green outline on sharp edges',
+            highlighted: _settings.peakingOn,
+            trailing: Switch(value: _settings.peakingOn, onChanged: (v) => _setAids(peaking: v)),
+          ),
+        ],
+      ),
+      PanelSection(
+        title: 'Stabilisation',
+        children: [
+          PanelTile(
+            icon: PhosphorIconsRegular.handGrabbing, title: 'Steady shot',
+            subtitle: _camera.isH264Mode ? 'Not available in H.264 mode' : 'Smooths hand shake (crops ~10%)',
+            highlighted: _camera.stabilizeOn,
+            trailing: Switch(value: _camera.stabilizeOn, onChanged: _camera.isH264Mode ? null : _setStabilize),
+          ),
+        ],
+      ),
+      PanelSection(
         title: 'Locks',
         children: [
           PanelTile(
@@ -1235,7 +1795,126 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
       );
 }
 
-enum _Tab { live, smart, image, studio, settings }
+enum _Tab { live, shots, smart, image, studio, settings }
+
+/// Zebra / focus-peaking overlay. The analysis image is in SOURCE orientation;
+/// this applies the same mirror + rotation the encoder does so it lines up
+/// with the preview.
+class _AidsPainter extends CustomPainter {
+  final ui.Image image;
+  final Rect frameRect;
+  final int rotation;
+  final bool mirror;
+  _AidsPainter({required this.image, required this.frameRect, required this.rotation, required this.mirror});
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    canvas.save();
+    canvas.clipRect(Offset.zero & size);
+    canvas.translate(frameRect.center.dx, frameRect.center.dy);
+    canvas.rotate(rotation * math.pi / 180);
+    if (mirror) canvas.scale(-1, 1);
+    final sideways = rotation % 180 == 90;
+    final w = sideways ? frameRect.height : frameRect.width;
+    final h = sideways ? frameRect.width : frameRect.height;
+    canvas.drawImageRect(
+      image,
+      Rect.fromLTWH(0, 0, image.width.toDouble(), image.height.toDouble()),
+      Rect.fromCenter(center: Offset.zero, width: w, height: h),
+      Paint()..filterQuality = FilterQuality.none,
+    );
+    canvas.restore();
+  }
+
+  @override
+  bool shouldRepaint(covariant _AidsPainter old) =>
+      old.image != image || old.frameRect != frameRect || old.rotation != rotation || old.mirror != mirror;
+}
+
+/// Rule-of-thirds guides over the picture that is actually SENT — i.e. the
+/// zoom/Smart-Zoom crop, not the whole sensor frame. Follows the crop as it moves.
+class _GridPainter extends CustomPainter {
+  final CameraService camera;
+  final Rect frameRect;
+  _GridPainter(this.camera, this.frameRect) : super(repaint: camera.framingTick);
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final c = camera.framer.crop;
+    final r = Rect.fromLTWH(
+      frameRect.left + c.left * frameRect.width, frameRect.top + c.top * frameRect.height,
+      c.width * frameRect.width, c.height * frameRect.height,
+    );
+    final p = Paint()..color = const Color(0x66FFFFFF)..strokeWidth = 1;
+    canvas.save();
+    canvas.clipRect(Offset.zero & size);
+    for (var i = 1; i <= 2; i++) {
+      final x = r.left + r.width * i / 3, y = r.top + r.height * i / 3;
+      canvas.drawLine(Offset(x, r.top), Offset(x, r.bottom), p);
+      canvas.drawLine(Offset(r.left, y), Offset(r.right, y), p);
+    }
+    canvas.restore();
+  }
+
+  @override
+  bool shouldRepaint(covariant _GridPainter old) => old.frameRect != frameRect;
+}
+
+/// Horizon level: a line that stays parallel to the real horizon, with fixed
+/// reference ticks. Green within ±1°.
+class _LevelPainter extends CustomPainter {
+  final double tilt; // radians
+  _LevelPainter(this.tilt);
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final c = size.center(Offset.zero);
+    final deg = tilt * 180 / math.pi;
+    final level = deg.abs() < 1.0;
+    final color = level ? C.ok : C.text;
+    final half = size.width * 0.13;
+    final ref = Paint()..color = const Color(0x99FFFFFF)..strokeWidth = 2..strokeCap = StrokeCap.round;
+    canvas.drawLine(c + Offset(-half - 28, 0), c + Offset(-half - 8, 0), ref);
+    canvas.drawLine(c + Offset(half + 8, 0), c + Offset(half + 28, 0), ref);
+    canvas.save();
+    canvas.translate(c.dx, c.dy);
+    canvas.rotate(-tilt);
+    canvas.drawLine(Offset(-half, 0), Offset(half, 0), Paint()..color = color..strokeWidth = level ? 3 : 2..strokeCap = StrokeCap.round);
+    canvas.restore();
+    if (!level) {
+      final tp = TextPainter(
+        text: TextSpan(text: '${deg.abs().toStringAsFixed(1)}°', style: T.hud.copyWith(color: C.text)),
+        textDirection: TextDirection.ltr,
+      )..layout();
+      tp.paint(canvas, c + Offset(-tp.width / 2, 10));
+    }
+  }
+
+  @override
+  bool shouldRepaint(covariant _LevelPainter old) => (old.tilt - tilt).abs() > 0.0005;
+}
+
+/// Five-segment audio meter for the HUD.
+class _MiniMeter extends StatelessWidget {
+  final double level; // 0..1 RMS
+  const _MiniMeter({required this.level});
+
+  @override
+  Widget build(BuildContext context) {
+    // RMS → rough dBFS → 0..5 lit segments (-50 dB … -6 dB).
+    final db = level <= 0 ? -90.0 : 20 * math.log(level) / math.ln10;
+    final lit = ((db + 50) / 44 * 5).clamp(0, 5).round();
+    return Row(mainAxisSize: MainAxisSize.min, children: List.generate(5, (i) {
+      final on = i < lit;
+      final col = i >= 4 ? C.tally : (i >= 3 ? C.warn : C.ok);
+      return Container(
+        width: 4, height: 6.0 + i * 2.5,
+        margin: const EdgeInsets.only(left: 2),
+        decoration: BoxDecoration(color: on ? col : C.surface3, borderRadius: BorderRadius.circular(1)),
+      );
+    }));
+  }
+}
 
 /// Draws the Smart Zoom program frame over the full camera preview: everything
 /// outside the crop is dimmed, the crop gets broadcast-style corner marks, and

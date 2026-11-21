@@ -11,6 +11,15 @@ class AppSettings {
   final int tcpPort;
   final int videoLongEdge; // requested longest edge px (3840=4K … 640=360p)
   final int videoFps;      // 30 | 60
+  // Viewfinder aids (on-phone only; never baked into the stream).
+  final bool gridOn;
+  final bool levelOn;
+  final bool zebraOn;
+  final bool peakingOn;
+  // Digital image stabilisation (crops ~10% to absorb hand shake).
+  final bool stabilize;
+  // 'mjpeg' (stable default) | 'h264' (beta, sharper at the same bandwidth).
+  final String videoCodec;
 
   const AppSettings({
     this.deviceName = 'Church Mobile',
@@ -20,11 +29,19 @@ class AppSettings {
     this.tcpPort = 8766,
     this.videoLongEdge = 1920, // default 1080p
     this.videoFps = 30,
+    this.gridOn = false,
+    this.levelOn = false,
+    this.zebraOn = false,
+    this.peakingOn = false,
+    this.stabilize = false,
+    this.videoCodec = 'mjpeg',
   });
 
   AppSettings copyWith({
     String? deviceName, String? preferredPosition, bool? audioEnabled,
     int? wsPort, int? tcpPort, int? videoLongEdge, int? videoFps,
+    bool? gridOn, bool? levelOn, bool? zebraOn, bool? peakingOn, bool? stabilize,
+    String? videoCodec,
   }) => AppSettings(
         deviceName: deviceName ?? this.deviceName,
         preferredPosition: preferredPosition ?? this.preferredPosition,
@@ -33,12 +50,20 @@ class AppSettings {
         tcpPort: tcpPort ?? this.tcpPort,
         videoLongEdge: videoLongEdge ?? this.videoLongEdge,
         videoFps: videoFps ?? this.videoFps,
+        gridOn: gridOn ?? this.gridOn,
+        levelOn: levelOn ?? this.levelOn,
+        zebraOn: zebraOn ?? this.zebraOn,
+        peakingOn: peakingOn ?? this.peakingOn,
+        stabilize: stabilize ?? this.stabilize,
+        videoCodec: videoCodec ?? this.videoCodec,
       );
 
   Map<String, dynamic> toJson() => {
         'deviceName': deviceName, 'preferredPosition': preferredPosition,
         'audioEnabled': audioEnabled, 'wsPort': wsPort, 'tcpPort': tcpPort,
         'videoLongEdge': videoLongEdge, 'videoFps': videoFps,
+        'gridOn': gridOn, 'levelOn': levelOn, 'zebraOn': zebraOn,
+        'peakingOn': peakingOn, 'stabilize': stabilize, 'videoCodec': videoCodec,
       };
 
   factory AppSettings.fromJson(Map j) => AppSettings(
@@ -49,7 +74,54 @@ class AppSettings {
         tcpPort: (j['tcpPort'] is int) ? j['tcpPort'] as int : 8766,
         videoLongEdge: (j['videoLongEdge'] is int) ? j['videoLongEdge'] as int : 1920,
         videoFps: (j['videoFps'] is int) ? j['videoFps'] as int : 30,
+        gridOn: j['gridOn'] == true,
+        levelOn: j['levelOn'] == true,
+        zebraOn: j['zebraOn'] == true,
+        peakingOn: j['peakingOn'] == true,
+        stabilize: j['stabilize'] == true,
+        videoCodec: j['videoCodec'] == 'h264' ? 'h264' : 'mjpeg',
       );
+}
+
+// ── Saved shots (camera presets) ──────────────────────────────────────────────
+/// A recallable framing: lens zoom + the digital crop window (output space).
+class ShotPreset {
+  final String id;
+  final String name;
+  final double hwZoom;  // lens zoom (1 when the phone has no optical zoom)
+  final double crop;    // digital crop factor (1 = full frame)
+  final double cx, cy;  // crop centre, 0..1
+  const ShotPreset({required this.id, required this.name, required this.hwZoom, required this.crop, required this.cx, required this.cy});
+
+  ShotPreset renamed(String n) => ShotPreset(id: id, name: n, hwZoom: hwZoom, crop: crop, cx: cx, cy: cy);
+
+  Map<String, dynamic> toJson() => {'id': id, 'name': name, 'hwZoom': hwZoom, 'crop': crop, 'cx': cx, 'cy': cy};
+  factory ShotPreset.fromJson(Map j) => ShotPreset(
+        id: j['id'].toString(),
+        name: (j['name'] ?? 'Shot').toString(),
+        hwZoom: (j['hwZoom'] as num?)?.toDouble() ?? 1,
+        crop: (j['crop'] as num?)?.toDouble() ?? 1,
+        cx: (j['cx'] as num?)?.toDouble() ?? 0.5,
+        cy: (j['cy'] as num?)?.toDouble() ?? 0.5,
+      );
+}
+
+const _shotsKey = 'churchcam.shots';
+
+Future<List<ShotPreset>> loadShots() async {
+  final prefs = await SharedPreferences.getInstance();
+  final raw = prefs.getString(_shotsKey);
+  if (raw == null) return [];
+  try {
+    return (jsonDecode(raw) as List).whereType<Map>().map(ShotPreset.fromJson).toList();
+  } catch (_) {
+    return [];
+  }
+}
+
+Future<void> saveShots(List<ShotPreset> shots) async {
+  final prefs = await SharedPreferences.getInstance();
+  await prefs.setString(_shotsKey, jsonEncode(shots.map((s) => s.toJson()).toList()));
 }
 
 const _settingsKey = 'churchcam.settings';

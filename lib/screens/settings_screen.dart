@@ -10,7 +10,9 @@ import '../ui/components.dart';
 /// shared_preferences — there's no Save button to forget.
 class SettingsPanel extends StatefulWidget {
   final VoidCallback onDisconnect;
-  const SettingsPanel({super.key, required this.onDisconnect});
+  /// Lets the camera screen keep its copy in sync (it persists aids/audio too).
+  final ValueChanged<AppSettings>? onSettingsChanged;
+  const SettingsPanel({super.key, required this.onDisconnect, this.onSettingsChanged});
 
   @override
   State<SettingsPanel> createState() => _SettingsPanelState();
@@ -51,6 +53,7 @@ class _SettingsPanelState extends State<SettingsPanel> {
   @override
   void initState() {
     super.initState();
+    // Always read fresh: the camera screen persists aids / audio changes too.
     loadSettings().then((s) {
       if (!mounted) return;
       setState(() {
@@ -73,6 +76,7 @@ class _SettingsPanelState extends State<SettingsPanel> {
       videoFps: _fps,
     );
     await saveSettings(_s);
+    widget.onSettingsChanged?.call(_s);
   }
 
   @override
@@ -144,18 +148,32 @@ class _SettingsPanelState extends State<SettingsPanel> {
               },
             ),
           ),
-          PanelTile(
-            icon: _s.audioEnabled ? PhosphorIconsRegular.microphone : PhosphorIconsRegular.microphoneSlash,
-            title: 'Audio',
-            subtitle: _s.audioEnabled ? 'Sending microphone audio' : 'Video only',
-            trailing: Switch(
-              value: _s.audioEnabled,
-              onChanged: (v) async {
-                setState(() => _s = _s.copyWith(audioEnabled: v));
-                await _persist();
-              },
+        ],
+      ),
+      PanelSection(
+        title: 'Video codec',
+        children: [
+          Wrap(spacing: S.sm, runSpacing: S.sm, children: [
+            Choice(
+              label: 'MJPEG · stable', icon: PhosphorIconsRegular.shieldCheck,
+              selected: _s.videoCodec != 'h264',
+              onTap: () async { setState(() => _s = _s.copyWith(videoCodec: 'mjpeg')); await _persist(); },
             ),
-          ),
+            Choice(
+              label: 'H.264 · beta', icon: PhosphorIconsRegular.lightning,
+              selected: _s.videoCodec == 'h264',
+              onTap: () async { setState(() => _s = _s.copyWith(videoCodec: 'h264')); await _persist(); },
+            ),
+          ]),
+          const SizedBox(height: S.sm),
+          Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
+            PhosphorIcon(PhosphorIconsRegular.info, size: 16, color: C.textFaint),
+            const SizedBox(width: 6),
+            const Expanded(child: Text(
+              'H.264 gives a sharper picture on the same Wi-Fi, but some phones show green frames. '
+              'Smart Zoom, steady shot and backup recording need MJPEG. Applies on the next connect.',
+              style: T.caption)),
+          ]),
         ],
       ),
       PanelSection(

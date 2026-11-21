@@ -18,7 +18,8 @@ import 'dart:typed_data';
 const int kV2Magic = 0xCB;
 const int kV2HeaderLen = 16;
 
-enum V2FrameType { config, key, delta }
+/// `audio` (type 3) carries raw PCM: s16le, mono, 48 kHz, ~20 ms per frame.
+enum V2FrameType { config, key, delta, audio }
 
 int _typeByte(V2FrameType t) {
   switch (t) {
@@ -28,6 +29,8 @@ int _typeByte(V2FrameType t) {
       return 1;
     case V2FrameType.delta:
       return 2;
+    case V2FrameType.audio:
+      return 3;
   }
 }
 

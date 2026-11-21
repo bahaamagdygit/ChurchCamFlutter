@@ -223,6 +223,19 @@ class SmartFramer {
   /// Digital zoom used when the phone has no hardware zoom (centre crop).
   double baseZoom = 1.0;
 
+  /// Manual framing centre when not following anyone (one-finger pan, saved
+  /// shots). Smart Zoom release glides back here.
+  double mx = 0.5, my = 0.5;
+
+  /// Digital stabilisation: a minimum crop that leaves margin to absorb shake,
+  /// and the current correction offset (output space, added to the centre).
+  double stabMinZoom = 1.0;
+  double stabX = 0, stabY = 0;
+
+  /// Effective zoom actually applied (manual / smart zoom, never below the
+  /// stabiliser's margin).
+  double get _floorZoom => math.max(1.0, stabMinZoom);
+
   /// Last known subject position (output space), for the on-phone marker.
   Offset? subject;
 
@@ -230,7 +243,7 @@ class SmartFramer {
   static const double _zoomOmega = 2.6;
   static const double _maxPanSpeed = 0.55; // frame-widths per second
 
-  bool get isIdentity => zoom < 1.002 && tz < 1.002;
+  bool get isIdentity => zoom < 1.002 && tz < 1.002 && stabX == 0 && stabY == 0;
 
   void lock(Offset p, {double? zoom}) {
     locked = true;
@@ -245,9 +258,41 @@ class SmartFramer {
     locked = false;
     lost = false;
     subject = null;
-    tz = baseZoom;
-    tx = 0.5;
-    ty = 0.5;
+    tz = math.max(baseZoom, _floorZoom);
+    tx = mx;
+    ty = my;
+    _clampTarget();
+  }
+
+  /// Glide to an exact framing (saved shot recall). Not a lock: nobody is
+  /// followed, the frame just moves there like a motorised head would.
+  void goTo(double centreX, double centreY, double cropZoom) {
+    locked = false;
+    lost = false;
+    subject = null;
+    baseZoom = cropZoom.clamp(1.0, ShotSize.max);
+    mx = centreX;
+    my = centreY;
+    tz = math.max(baseZoom, _floorZoom);
+    tx = mx;
+    ty = my;
+    _clampTarget();
+    mx = tx;
+    my = ty;
+  }
+
+  /// One-finger pan of a zoomed frame. [dx]/[dy] are in output-frame units
+  /// (a full-width drag = 1.0). Moves immediately so it tracks the finger.
+  void panBy(double dx, double dy) {
+    if (locked) return;
+    final h = 0.5 / math.max(tz, 1.0);
+    mx = (mx - dx).clamp(h, 1 - h);
+    my = (my - dy).clamp(h, 1 - h);
+    tx = mx;
+    ty = my;
+    cx = mx;
+    cy = my;
+    _vx = _vy = 0;
   }
 
   void setShot(double z) {
@@ -261,10 +306,21 @@ class SmartFramer {
   void setBaseZoom(double z) {
     baseZoom = z.clamp(1.0, ShotSize.max);
     if (!locked) {
-      tz = baseZoom;
-      tx = 0.5;
-      ty = 0.5;
+      // Keep the operator's framing centre while zooming (only re-clamped so
+      // the crop stays inside the picture).
+      tz = math.max(baseZoom, _floorZoom);
+      tx = mx;
+      ty = my;
+      _clampTarget();
+      if (baseZoom <= 1.0005) { mx = 0.5; my = 0.5; tx = 0.5; ty = 0.5; }
     }
+  }
+
+  /// Turn the stabiliser's crop margin on/off.
+  void setStabilizerMargin(bool on) {
+    stabMinZoom = on ? 1.12 : 1.0;
+    if (!on) { stabX = 0; stabY = 0; }
+    if (!locked) tz = math.max(baseZoom, _floorZoom);
   }
 
   /// New subject position from the tracker.
@@ -322,7 +378,7 @@ class SmartFramer {
 
     // Snap to exact identity when fully zoomed out, so the encoder takes the
     // untouched full-frame path.
-    if (!locked && tz <= 1.0005 && (zoom - 1).abs() < 0.002) {
+    if (!locked && tz <= 1.0005 && (zoom - 1).abs() < 0.002 && stabMinZoom <= 1.0) {
       zoom = 1;
       cx = 0.5;
       cy = 0.5;
@@ -342,10 +398,14 @@ class SmartFramer {
     return (nx, nv);
   }
 
-  /// Current crop in output space, normalized.
+  /// Current crop in output space, normalized (stabiliser correction applied,
+  /// kept inside the frame).
   Rect get crop {
     final w = 1 / zoom;
-    return Rect.fromLTWH(cx - w / 2, cy - w / 2, w, w);
+    final h = w / 2;
+    final x = (cx + stabX).clamp(h, 1 - h);
+    final y = (cy + stabY).clamp(h, 1 - h);
+    return Rect.fromLTWH(x - h, y - h, w, w);
   }
 
   /// Map a point given relative to the CURRENT program output (what the
