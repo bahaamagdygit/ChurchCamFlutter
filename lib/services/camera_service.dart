@@ -1,10 +1,11 @@
 import 'dart:async';
-import 'dart:ui' show Offset;
+import 'dart:ui' show Offset, Rect;
 import 'package:flutter/foundation.dart';
 import 'package:camera/camera.dart';
 import 'jpeg_encoder.dart';
 import 'h264_encoder_channel.dart';
 import 'cam2_encoder_channel.dart';
+import 'smart_framer.dart';
 
 /// Owns the camera hardware: preview, live frame capture, zoom, flip and torch.
 ///
@@ -68,6 +69,37 @@ class CameraService extends ChangeNotifier {
   double _zoom = 1.0;
   double _minZoom = 1.0;
   double _maxZoom = 1.0;
+  // Hardware zoom can be missing (fixed-focal lens reports min == max) or can
+  // throw on some devices/plugin versions. Either way we fall back to a DIGITAL
+  // zoom — a centre crop taken from the full-resolution frame — so the zoom
+  // control always does something visible on the stream.
+  bool _hwZoomFailed = false;
+  static const double _digitalMaxZoom = ShotSize.max;
+  bool get hasHardwareZoom => !_hwZoomFailed && (_maxZoom - _minZoom) > 0.05;
+  // Latest-wins zoom application: a pinch fires ~60 updates/s; queueing every
+  // one of them on the camera makes zoom lag seconds behind the fingers (or get
+  // cancelled by the next call on CameraX). Only one call in flight; the newest
+  // requested value is applied next.
+  double? _pendingZoom;
+  bool _zoomBusy = false;
+  Timer? _zoomAnim;
+
+  // ── Smart Zoom ───────────────────────────────────────────────────────────────
+  final SmartFramer framer = SmartFramer();
+  final PatchTracker tracker = PatchTracker();
+  /// Ticks ~20×/s while framing is animating — the overlay listens to this
+  /// instead of rebuilding the whole camera screen.
+  final ValueNotifier<int> framingTick = ValueNotifier<int>(0);
+  /// Fired when the Smart Zoom state changes meaningfully (lock / lost / shot),
+  /// so the screen can report it to the desktop.
+  VoidCallback? onSmartZoomChanged;
+  Offset? _pendingLockOut;  // lock request waiting for the next frame
+  int _lastTrackMs = 0;
+  int _lastTickUs = 0;
+  int _lastFramingNotifyMs = 0;
+  bool _lastLost = false;
+  bool get smartZoomActive => framer.locked;
+
   bool _torchOn = false;
   // AE/AF lock state — when locked the camera holds the current focus/exposure
   // instead of continuously hunting (important for a fixed church shot).
@@ -110,8 +142,8 @@ class CameraService extends ChangeNotifier {
   bool get isInitialized => _controller?.value.isInitialized ?? false;
   bool get isStreaming => _streaming;
   double get zoom => _zoom;
-  double get minZoom => _minZoom;
-  double get maxZoom => _maxZoom;
+  double get minZoom => zoomMin;
+  double get maxZoom => zoomMax;
   bool get torchOn => _torchOn;
   bool get hasTorch => _currentLensIsBack;
   bool get focusLocked => _focusLocked;
@@ -158,10 +190,26 @@ class CameraService extends ChangeNotifier {
     _focusLocked = false;
     _exposureLocked = false;
 
-    _minZoom = await controller.getMinZoomLevel();
-    _maxZoom = await controller.getMaxZoomLevel();
-    _zoom = _zoom.clamp(_minZoom, _maxZoom);
-    try { await controller.setZoomLevel(_zoom); } catch (_) {}
+    _hwZoomFailed = false;
+    try {
+      _minZoom = await controller.getMinZoomLevel();
+      _maxZoom = await controller.getMaxZoomLevel();
+    } catch (_) {
+      _minZoom = 1.0;
+      _maxZoom = 1.0;
+    }
+    if (hasHardwareZoom) {
+      _zoom = _zoom.clamp(_minZoom, _maxZoom);
+      try { await controller.setZoomLevel(_zoom); } catch (_) { _hwZoomFailed = true; }
+    }
+    if (!hasHardwareZoom) {
+      _zoom = _zoom.clamp(1.0, _digitalMaxZoom);
+      framer.setBaseZoom(_zoom);
+    } else {
+      framer.setBaseZoom(1.0);
+    }
+    debugPrint('[CameraService] zoom range ${_minZoom.toStringAsFixed(2)}–${_maxZoom.toStringAsFixed(2)} '
+        '(${hasHardwareZoom ? "hardware" : "digital fallback"})');
     _torchOn = false;
 
     notifyListeners();
@@ -171,9 +219,14 @@ class CameraService extends ChangeNotifier {
     }
   }
 
+  /// Zoom range the UI should offer (hardware range, or 1–4× digital).
+  double get zoomMin => hasHardwareZoom ? _minZoom : 1.0;
+  double get zoomMax => hasHardwareZoom ? _maxZoom : _digitalMaxZoom;
+
   Map<String, dynamic> capabilities() {
     return {
-      'zoom': {'min': _minZoom, 'max': _maxZoom, 'step': 0.1, 'neutral': _minZoom},
+      'zoom': {'min': zoomMin, 'max': zoomMax, 'step': 0.1, 'neutral': zoomMin, 'hardware': hasHardwareZoom},
+      'smartZoom': true,
       'torchSupported': hasTorch,
       'cameras': _cameras
           .map((c) => {
@@ -339,6 +392,11 @@ class CameraService extends ChangeNotifier {
   final int _epochUs = DateTime.now().microsecondsSinceEpoch;
 
   void _onCameraImage(CameraImage image) {
+    // Smart Zoom / digital zoom runs on EVERY delivered frame (before the
+    // throttles below), so tracking and camera motion stay smooth even when
+    // the network is dropping frames.
+    try { _updateFraming(image); } catch (e) { debugPrint('[CameraService] framing error: $e'); }
+
     // FPS throttle (shared by both codecs).
     final now = DateTime.now();
     final minGapMs = (1000 / _targetFps).round();
@@ -498,10 +556,134 @@ class CameraService extends ChangeNotifier {
     return ((deg % 360) + 360) % 360;
   }
 
+  // ── Smart Zoom: coordinate spaces ────────────────────────────────────────────
+  // SOURCE = the raw sensor frame the tracker and encoder read.
+  // OUTPUT = what the audience sees (after the encoder's mirror + rotation),
+  //          which is also what the phone preview and desktop show.
+  // The encoder mirrors first, then rotates clockwise by _computeRotation().
+  bool get _mirrorOut => lensDirection == CameraLensDirection.front;
+
+  Offset srcToOut(Offset p) {
+    var x = p.dx, y = p.dy;
+    if (_mirrorOut) x = 1 - x;
+    switch (_computeRotation()) {
+      case 90: return Offset(1 - y, x);
+      case 180: return Offset(1 - x, 1 - y);
+      case 270: return Offset(y, 1 - x);
+      default: return Offset(x, y);
+    }
+  }
+
+  Offset outToSrc(Offset o) {
+    double x, y;
+    switch (_computeRotation()) {
+      case 90: x = o.dy; y = 1 - o.dx; break;
+      case 180: x = 1 - o.dx; y = 1 - o.dy; break;
+      case 270: x = 1 - o.dy; y = o.dx; break;
+      default: x = o.dx; y = o.dy;
+    }
+    if (_mirrorOut) x = 1 - x;
+    return Offset(x, y);
+  }
+
+  Rect _outRectToSrc(Rect r) => Rect.fromPoints(outToSrc(r.topLeft), outToSrc(r.bottomRight));
+
+  /// Lock Smart Zoom onto a point of the FULL output frame (phone preview tap).
+  void smartLock(Offset out, {double? zoom}) {
+    if (zoom != null) framer.shotZoom = zoom.clamp(1.0, ShotSize.max);
+    _pendingLockOut = Offset(out.dx.clamp(0.0, 1.0), out.dy.clamp(0.0, 1.0));
+  }
+
+  /// Lock onto a point of the current PROGRAM picture (desktop preview click).
+  void smartLockProgram(Offset program, {double? zoom}) =>
+      smartLock(framer.programToFull(program), zoom: zoom);
+
+  void smartRelease() {
+    tracker.release();
+    framer.release();
+    _pendingLockOut = null;
+    onSmartZoomChanged?.call();
+    notifyListeners();
+  }
+
+  void smartSetShot(double zoom) {
+    framer.setShot(zoom);
+    onSmartZoomChanged?.call();
+    notifyListeners();
+  }
+
+  void smartSetFollow(bool follow) {
+    framer.follow = follow;
+    onSmartZoomChanged?.call();
+    notifyListeners();
+  }
+
+  Map<String, dynamic> smartZoomState() => {
+        'active': framer.locked,
+        'follow': framer.follow,
+        'lost': framer.locked && tracker.lost,
+        'shot': framer.shotZoom,
+        'supported': !_h264Mode,
+      };
+
+  void _updateFraming(CameraImage image) {
+    final nowUs = DateTime.now().microsecondsSinceEpoch;
+    final dt = _lastTickUs == 0 ? 0.033 : (nowUs - _lastTickUs) / 1e6;
+    _lastTickUs = nowUs;
+    final yuv = image.format.group == ImageFormatGroup.yuv420 && image.planes.isNotEmpty;
+
+    // A pending lock needs real pixels to build the template from.
+    final lockOut = _pendingLockOut;
+    if (lockOut != null && yuv) {
+      _pendingLockOut = null;
+      final src = outToSrc(lockOut);
+      final p = image.planes[0];
+      tracker.lockAt(p.bytes, image.width, image.height, p.bytesPerRow, src.dx, src.dy);
+      framer.lock(lockOut, zoom: framer.shotZoom);
+      _lastLost = false;
+      onSmartZoomChanged?.call();
+      notifyListeners();
+    }
+
+    // Track at ~15 Hz — plenty for a person walking, and keeps CPU low.
+    final nowMs = nowUs ~/ 1000;
+    if (tracker.active && framer.locked && framer.follow && yuv && nowMs - _lastTrackMs >= 66) {
+      _lastTrackMs = nowMs;
+      final p = image.planes[0];
+      tracker.update(p.bytes, image.width, image.height, p.bytesPerRow);
+      if (tracker.lost) {
+        framer.lost = true;  // hold the shot where it is
+      } else {
+        framer.onSubject(srcToOut(Offset(tracker.x, tracker.y)));
+      }
+      if (tracker.lost != _lastLost) {
+        _lastLost = tracker.lost;
+        onSmartZoomChanged?.call();
+      }
+    }
+
+    final wasIdentity = framer.isIdentity;
+    framer.tick(dt);
+    // Repaint the on-phone framing overlay at ~20 Hz while anything moves.
+    if ((!wasIdentity || !framer.isIdentity || framer.locked) && nowMs - _lastFramingNotifyMs >= 50) {
+      _lastFramingNotifyMs = nowMs;
+      framingTick.value++;
+    }
+  }
+
   /// Copy the camera planes into a transferable [RawFrame] for the isolate.
   RawFrame? _packFrame(CameraImage image) {
     final mirror = lensDirection == CameraLensDirection.front;
     final rot = _computeRotation();
+    // Current Smart Zoom / digital-zoom crop, in source coordinates.
+    Rect crop = const Rect.fromLTWH(0, 0, 1, 1);
+    if (!framer.isIdentity) {
+      final r = _outRectToSrc(framer.crop);
+      crop = Rect.fromLTRB(
+        r.left.clamp(0.0, 1.0), r.top.clamp(0.0, 1.0),
+        r.right.clamp(0.0, 1.0), r.bottom.clamp(0.0, 1.0),
+      );
+    }
     if (image.format.group == ImageFormatGroup.yuv420) {
       if (image.planes.length < 3) return null;
       return RawFrame(
@@ -512,6 +694,10 @@ class CameraService extends ChangeNotifier {
         quality: _jpegQuality,
         mirror: mirror,
         rotation: rot,
+        cropX: crop.left,
+        cropY: crop.top,
+        cropW: crop.width,
+        cropH: crop.height,
         y: image.planes[0].bytes,
         u: image.planes[1].bytes,
         v: image.planes[2].bytes,
@@ -528,6 +714,10 @@ class CameraService extends ChangeNotifier {
         quality: _jpegQuality,
         mirror: mirror,
         rotation: rot,
+        cropX: crop.left,
+        cropY: crop.top,
+        cropW: crop.width,
+        cropH: crop.height,
         bgra: image.planes[0].bytes,
       );
     }
@@ -535,13 +725,71 @@ class CameraService extends ChangeNotifier {
   }
 
   // ── Controls ────────────────────────────────────────────────────────────────
+  /// Set the zoom immediately (pinch / slider). Hardware zoom when the lens
+  /// supports it, otherwise a digital centre crop. Latest value wins.
   Future<void> setZoom(double zoom) async {
+    _zoomAnim?.cancel();
+    _zoomAnim = null;
+    await _applyZoomNow(zoom);
+  }
+
+  Future<void> _applyZoomNow(double zoom) async {
     final c = _controller;
     if (c == null || !c.value.isInitialized) return;
-    final clamped = zoom.clamp(_minZoom, _maxZoom).toDouble();
+    final clamped = zoom.clamp(zoomMin, zoomMax).toDouble();
     _zoom = clamped;
-    try { await c.setZoomLevel(clamped); } catch (_) {}
     notifyListeners();
+
+    if (!hasHardwareZoom) {
+      framer.setBaseZoom(clamped);
+      return;
+    }
+
+    _pendingZoom = clamped;
+    if (_zoomBusy) return;   // the running loop below will pick up the newest value
+    _zoomBusy = true;
+    try {
+      while (_pendingZoom != null) {
+        final z = _pendingZoom!;
+        _pendingZoom = null;
+        final ctl = _controller;
+        if (ctl == null || !ctl.value.isInitialized) break;
+        try {
+          await ctl.setZoomLevel(z);
+        } catch (e) {
+          // CameraX cancels an in-progress zoom when a newer one arrives —
+          // that's not a failure, the newer value will be applied.
+          if (e.toString().toLowerCase().contains('cancel')) continue;
+          // Hardware zoom refused — switch this lens to digital zoom so the
+          // control keeps working instead of silently doing nothing.
+          debugPrint('[CameraService] setZoomLevel failed ($e) — using digital zoom');
+          _hwZoomFailed = true;
+          final dz = z.clamp(1.0, _digitalMaxZoom).toDouble();
+          _zoom = dz;
+          framer.setBaseZoom(dz);
+          notifyListeners();
+          break;
+        }
+      }
+    } finally {
+      _zoomBusy = false;
+    }
+  }
+
+  /// Smoothly animate the zoom (remote commands, preset buttons) with an
+  /// ease-in-out curve — reads like a real zoom rocker, not a jump.
+  void animateZoomTo(double target, {int durationMs = 650}) {
+    _zoomAnim?.cancel();
+    final from = _zoom;
+    final to = target.clamp(zoomMin, zoomMax).toDouble();
+    if ((to - from).abs() < 0.01) { _applyZoomNow(to); return; }
+    final start = DateTime.now();
+    _zoomAnim = Timer.periodic(const Duration(milliseconds: 33), (t) {
+      final p = (DateTime.now().difference(start).inMilliseconds / durationMs).clamp(0.0, 1.0);
+      final e = p < 0.5 ? 4 * p * p * p : 1 - ((-2 * p + 2) * (-2 * p + 2) * (-2 * p + 2)) / 2;
+      _applyZoomNow(from + (to - from) * e);
+      if (p >= 1) { t.cancel(); if (identical(_zoomAnim, t)) _zoomAnim = null; }
+    });
   }
 
   Future<void> switchCamera() async {
@@ -549,6 +797,7 @@ class CameraService extends ChangeNotifier {
     _cameraIndex = (_cameraIndex + 1) % _cameras.length;
     _zoom = 1.0;
     _torchOn = false;
+    smartRelease();
     await _startController();
   }
 
@@ -635,6 +884,7 @@ class CameraService extends ChangeNotifier {
     _cameraIndex = idx;
     _zoom = 1.0;
     _torchOn = false;
+    smartRelease();
     await _startController();
     return true;
   }
@@ -730,6 +980,8 @@ class CameraService extends ChangeNotifier {
 
   @override
   void dispose() {
+    _zoomAnim?.cancel();
+    framingTick.dispose();
     _disposeController();
     _encoder.dispose();
     _h264.stop();

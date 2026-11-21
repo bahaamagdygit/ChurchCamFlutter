@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:math' as math;
 import 'package:flutter/material.dart';
 import 'package:camera/camera.dart';
 import 'package:provider/provider.dart';
@@ -9,6 +10,7 @@ import '../services/abr_controller.dart';
 import '../services/device_status_service.dart';
 import '../services/orientation_service.dart';
 import '../services/storage.dart';
+import '../services/smart_framer.dart';
 import '../models/camera_filters.dart';
 import '../utils/permissions.dart';
 import '../widgets/reading_overlay.dart';
@@ -41,6 +43,16 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
   // Pinch-to-zoom
   double _baseZoom = 1.0;
   bool _showZoomBar = false;
+  Timer? _zoomBarTimer;
+
+  // Smart Zoom: while this mode is on, tapping a person locks the shot on them.
+  bool _smartMode = false;
+  // Live switcher (pick which desktop camera is on air).
+  bool _showSwitcher = false;
+
+  // Phone → desktop state report (zoom + Smart Zoom), throttled.
+  Timer? _stateReportTimer;
+  bool _stateReportQueued = false;
 
   // Focus ring
   Offset? _focusPoint;
@@ -88,6 +100,7 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
     _filters = await loadFilters(_camera.lensDirection.name);
 
     _conn?.sendCapabilities(_camera.capabilities());
+    _camera.onSmartZoomChanged = _reportPhoneState;
     _camera.onJpegFrame = (jpeg) => _conn?.sendFrame(jpeg);
     _camera.canSendFrame = () => _conn?.canAcceptFrame ?? false;
     _camera.onEncoderRestart = (reason) => _conn?.reportUnsupported('encoder', 'restarted: $reason');
@@ -148,6 +161,27 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
     });
 
     if (mounted) setState(() => _initializing = false);
+    _reportPhoneState();
+  }
+
+  /// Tell the desktop the phone's current zoom + Smart Zoom state so its
+  /// controls show the truth. Throttled to ≤ ~7/s with a trailing send.
+  void _reportPhoneState() {
+    if (_stateReportTimer?.isActive ?? false) { _stateReportQueued = true; return; }
+    _sendPhoneStateNow();
+    _stateReportTimer = Timer(const Duration(milliseconds: 150), () {
+      if (_stateReportQueued) { _stateReportQueued = false; _sendPhoneStateNow(); }
+    });
+  }
+
+  void _sendPhoneStateNow() {
+    _conn?.sendPhoneState({
+      'zoom': _camera.zoom,
+      'zoomMin': _camera.minZoom,
+      'zoomMax': _camera.maxZoom,
+      'hardwareZoom': _camera.hasHardwareZoom,
+      'smartZoom': _camera.smartZoomState(),
+    });
   }
 
   // ALWAYS LANDSCAPE: the app is locked to landscape, so the feed is always
@@ -187,9 +221,45 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
       case 'set_zoom':
       case 'zoom':
         if (cmd.value is num) {
-          await _camera.setZoom((cmd.value as num).toDouble());
-          conn?.confirmControl('zoom', _camera.zoom);
+          final z = (cmd.value as num).toDouble();
+          // Big jumps (preset buttons) glide like a zoom rocker; small steps
+          // (a slider being dragged) apply directly so they track the hand.
+          if ((z - _camera.zoom).abs() > 0.6) {
+            _camera.animateZoomTo(z);
+          } else {
+            await _camera.setZoom(z);
+          }
+          conn?.confirmControl('zoom', z);
           _showZoomIndicator();
+          _reportPhoneState();
+        }
+        break;
+      case 'smart_zoom':
+        // Desktop-driven Smart Zoom. Coordinates from the desktop are relative
+        // to the PROGRAM picture it shows (already cropped), so they're mapped
+        // back through the current crop on this side.
+        if (cmd.value is Map) {
+          final v = cmd.value as Map;
+          final act = (v['action'] ?? '').toString();
+          final zoom = (v['zoom'] as num?)?.toDouble();
+          if (act == 'lock') {
+            final x = (v['x'] as num?)?.toDouble() ?? 0.5;
+            final y = (v['y'] as num?)?.toDouble() ?? 0.5;
+            if (v['space'] == 'full') {
+              _camera.smartLock(Offset(x, y), zoom: zoom);
+            } else {
+              _camera.smartLockProgram(Offset(x, y), zoom: zoom);
+            }
+            if (mounted) setState(() => _smartMode = true);
+          } else if (act == 'release') {
+            _camera.smartRelease();
+          } else if (act == 'shot' && zoom != null) {
+            _camera.smartSetShot(zoom);
+          } else if (act == 'follow') {
+            _camera.smartSetFollow(v['value'] == true);
+          }
+          conn?.confirmControl('smart_zoom', _camera.smartZoomState());
+          _reportPhoneState();
         }
         break;
       case 'focus':
@@ -285,6 +355,10 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
           conn?.confirmControl('filters', _filters.toJson());
         }
         break;
+      case 'desktop_state':
+        // Informational (camera list, tally, transition) — ConnectionService
+        // already stored it and the UI listens there. Not a command.
+        break;
       default:
         // Log + report anything we don't handle so the desktop knows.
         debugPrint('[CameraScreen] unsupported command: ${cmd.action}');
@@ -300,15 +374,59 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
     _conn?.sendControl('filters', f.toJson());
   }
 
+  // Local zoom is applied ON THE PHONE (hardware, or digital crop when the lens
+  // has no zoom) — so it's already in the picture the desktop receives. It used
+  // to also send 'set_zoom' to the desktop, which the desktop applied to its
+  // USB webcam instead of this phone. Now we only REPORT the value.
   Future<void> _applyZoom(double z) async {
     await _camera.setZoom(z);
-    _conn?.desktopZoom(_camera.zoom); // keep desktop software-zoom in sync
     _showZoomIndicator();
+    _reportPhoneState();
+  }
+
+  void _animateZoom(double z) {
+    _camera.animateZoomTo(z);
+    _showZoomIndicator();
+    Future.delayed(const Duration(milliseconds: 700), _reportPhoneState);
   }
 
   void _showZoomIndicator() {
+    if (!mounted) return;
     setState(() => _showZoomBar = true);
-    Future.delayed(const Duration(seconds: 2), () { if (mounted) setState(() => _showZoomBar = false); });
+    _zoomBarTimer?.cancel();
+    _zoomBarTimer = Timer(const Duration(seconds: 2), () { if (mounted) setState(() => _showZoomBar = false); });
+  }
+
+  // ── Smart Zoom (phone side) ──────────────────────────────────────────────────
+  /// Where the camera frame actually sits on screen (preview is cover-fitted,
+  /// so part of it is cropped off the screen edges).
+  Rect _frameRectOnScreen(Size size) {
+    final controller = _camera.controller;
+    if (controller == null) return Offset.zero & size;
+    final ar = controller.value.aspectRatio;
+    final landscapeAr = ar > 1 ? ar : (1 / ar);
+    final fw = landscapeAr * 1000, fh = 1000.0;
+    final s = math.max(size.width / fw, size.height / fh);
+    final dw = fw * s, dh = fh * s;
+    return Rect.fromLTWH((size.width - dw) / 2, (size.height - dh) / 2, dw, dh);
+  }
+
+  Offset _screenToFrame(Offset p, Size size) {
+    final r = _frameRectOnScreen(size);
+    return Offset(((p.dx - r.left) / r.width).clamp(0.0, 1.0), ((p.dy - r.top) / r.height).clamp(0.0, 1.0));
+  }
+
+  void _toggleSmartMode() {
+    setState(() => _smartMode = !_smartMode);
+    if (!_smartMode && _camera.smartZoomActive) _camera.smartRelease();
+  }
+
+  void _smartTap(TapDownDetails d, Size size) {
+    final p = _screenToFrame(d.localPosition, size);
+    _camera.smartLock(p);
+    // Focus + expose on the person too — they're the subject now.
+    _camera.focusAt(p.dx, p.dy);
+    _ringAt(Offset(d.localPosition.dx / size.width, d.localPosition.dy / size.height));
   }
 
   void _ringAt(Offset normalized) {
@@ -341,6 +459,9 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
     _adaptiveTimer?.cancel();
     _statusTimer?.cancel();
     _focusTimer?.cancel();
+    _zoomBarTimer?.cancel();
+    _stateReportTimer?.cancel();
+    _camera.onSmartZoomChanged = null;
     _deviceStatus.dispose();
     _abr?.dispose();
     _conn?.removeCommandListener(_onRemoteCommand);
@@ -373,11 +494,58 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
         fit: StackFit.expand,
         children: [
           GestureDetector(
+            // Opaque: the preview must win every touch on it, including the
+            // second finger of a pinch landing on an empty area.
+            behavior: HitTestBehavior.opaque,
             onScaleStart: (_) => _baseZoom = _camera.zoom,
-            onScaleUpdate: (d) { if (d.scale != 1.0) _applyZoom(_baseZoom * d.scale); },
-            onTapDown: (d) => _tapFocus(d, size),
+            onScaleUpdate: (d) {
+              if (d.pointerCount >= 2 && (d.scale - 1.0).abs() > 0.01) _applyZoom(_baseZoom * d.scale);
+            },
+            onTapDown: (d) => _smartMode ? _smartTap(d, size) : _tapFocus(d, size),
             child: FilteredPreview(filters: _filters, child: _buildPreview()),
           ),
+
+          // Smart Zoom framing: dims what the audience does NOT see and marks
+          // the followed person. Repaints from the camera's framing ticks only.
+          IgnorePointer(
+            child: CustomPaint(
+              size: size,
+              painter: _FramingPainter(
+                camera: _camera,
+                frameRect: _frameRectOnScreen(size),
+                showFrame: _smartMode || !_camera.framer.isIdentity,
+              ),
+            ),
+          ),
+
+          // ON AIR tally — red rim when the desktop has THIS phone live.
+          Consumer<ConnectionService>(
+            builder: (_, conn, __) => conn.isSelfLive
+                ? IgnorePointer(
+                    child: Container(
+                      decoration: BoxDecoration(border: Border.all(color: const Color(0xFFEF4444), width: 4)),
+                      alignment: Alignment.topCenter,
+                      padding: const EdgeInsets.only(top: 10),
+                      child: Container(
+                        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
+                        decoration: BoxDecoration(color: const Color(0xFFEF4444), borderRadius: BorderRadius.circular(6)),
+                        child: const Text('ON AIR', style: TextStyle(color: Colors.white, fontWeight: FontWeight.w900, letterSpacing: 1.5, fontSize: 12)),
+                      ),
+                    ),
+                  )
+                : const SizedBox.shrink(),
+          ),
+
+          if (_smartMode && !_camera.smartZoomActive)
+            Positioned(
+              top: 96, left: 0, right: 0,
+              child: IgnorePointer(child: Center(child: Container(
+                padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
+                decoration: BoxDecoration(color: const Color(0xCC000000), borderRadius: BorderRadius.circular(20), border: Border.all(color: _purple)),
+                child: const Text('اضغط على الشخص اللي عايز تتابعه  •  Tap a person to follow',
+                    style: TextStyle(color: Colors.white, fontSize: 13, fontWeight: FontWeight.w600)),
+              ))),
+            ),
 
           if (_focusPoint != null)
             Positioned(
@@ -409,10 +577,17 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
             _labelToggle('AE-L', _camera.exposureLocked,
                 () => _camera.setExposureLocked(!_camera.exposureLocked)),
             const SizedBox(width: 8),
+            _labelToggle('🎯 SMART', _smartMode, _toggleSmartMode),
+            const SizedBox(width: 8),
             _circle(_camera.torchOn ? Icons.flash_on : Icons.flash_off,
                 _camera.hasTorch ? () => _camera.toggleTorch() : null),
             const SizedBox(width: 8),
-            _circle(Icons.cameraswitch, () { _applyZoom(1.0); _camera.switchCamera(); }),
+            _circle(Icons.cameraswitch, () async {
+              await _camera.switchCamera();
+              if (mounted) setState(() => _smartMode = false);
+              _conn?.sendCapabilities(_camera.capabilities());
+              _reportPhoneState();
+            }),
           ])),
 
           if (_showZoomBar) _buildZoomBar(),
@@ -463,32 +638,56 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
             child: LinearProgressIndicator(value: pct.clamp(0.0, 1.0), backgroundColor: Colors.white24, valueColor: const AlwaysStoppedAnimation(_purple), minHeight: 4))),
           const SizedBox(width: 10),
           Text('${_camera.zoom.toStringAsFixed(1)}×', style: const TextStyle(color: _purple, fontWeight: FontWeight.bold)),
+          if (!_camera.hasHardwareZoom) ...[
+            const SizedBox(width: 6),
+            const Text('digital', style: TextStyle(color: Colors.white54, fontSize: 11)),
+          ],
         ]),
       )),
     );
   }
 
   Widget _buildBottomPanel() {
+    final zMin = _camera.minZoom;
+    final zMax = _camera.maxZoom > zMin ? _camera.maxZoom : zMin + 1;
+    final step = (zMax - zMin) / 10;
+    // Quick-zoom presets that exist on this lens.
+    final presets = <double>[1, 2, 3, 5].where((z) => z >= zMin - 0.01 && z <= zMax + 0.01).toList();
     return Positioned(
       bottom: 0, left: 0, right: 0,
       child: Container(
         color: const Color(0x99000000),
-        padding: const EdgeInsets.fromLTRB(12, 8, 12, 30),
+        padding: const EdgeInsets.fromLTRB(12, 6, 12, 26),
         child: Column(mainAxisSize: MainAxisSize.min, children: [
-          // Header row: zoom slider + filters toggle
+          // Header row: zoom −/slider/+ , presets, panels
           Row(children: [
-            const Icon(Icons.zoom_in, color: Colors.white54, size: 18),
+            _miniBtn(Icons.zoom_out, () => _applyZoom(_camera.zoom - step)),
             Expanded(child: Slider(
-              value: _camera.zoom.clamp(_camera.minZoom, _camera.maxZoom),
-              min: _camera.minZoom, max: _camera.maxZoom == _camera.minZoom ? _camera.minZoom + 1 : _camera.maxZoom,
+              value: _camera.zoom.clamp(zMin, zMax),
+              min: zMin, max: zMax,
               activeColor: _purple,
               onChanged: (v) => _applyZoom(v),
             )),
+            _miniBtn(Icons.zoom_in, () => _applyZoom(_camera.zoom + step)),
+            const SizedBox(width: 6),
+            ...presets.map((z) => Padding(
+                  padding: const EdgeInsets.only(right: 4),
+                  child: _pill('${z.toStringAsFixed(0)}×', (_camera.zoom - z).abs() < 0.05, () => _animateZoom(z)),
+                )),
             IconButton(
+              tooltip: 'Live switcher',
+              icon: Icon(Icons.switch_video, color: _showSwitcher ? _purple : Colors.white70),
+              onPressed: () => setState(() { _showSwitcher = !_showSwitcher; if (_showSwitcher) _showFilters = false; }),
+            ),
+            IconButton(
+              tooltip: 'Filters',
               icon: Icon(Icons.auto_awesome, color: _showFilters ? _purple : Colors.white70),
-              onPressed: () => setState(() => _showFilters = !_showFilters),
+              onPressed: () => setState(() { _showFilters = !_showFilters; if (_showFilters) _showSwitcher = false; }),
             ),
           ]),
+
+          if (_smartMode) _buildSmartRow(),
+          if (_showSwitcher) _buildSwitcher(),
 
           if (_showFilters) ...[
             SizedBox(height: 44, child: ListView(
@@ -511,6 +710,123 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
       ),
     );
   }
+
+  /// Smart Zoom controls: shot size, follow on/off, release.
+  Widget _buildSmartRow() {
+    final f = _camera.framer;
+    final active = _camera.smartZoomActive;
+    final lost = active && _camera.tracker.lost;
+    final shots = const [
+      ('Wide', ShotSize.wide),
+      ('Medium', ShotSize.medium),
+      ('Close', ShotSize.close),
+    ];
+    return Padding(
+      padding: const EdgeInsets.only(top: 2, bottom: 4),
+      child: Row(children: [
+        Icon(lost ? Icons.person_off : Icons.person_pin_circle,
+            color: lost ? const Color(0xFFF59E0B) : (active ? const Color(0xFF22C55E) : Colors.white54), size: 20),
+        const SizedBox(width: 6),
+        Expanded(
+          child: Text(
+            !active ? 'Smart Zoom: tap a person' : (lost ? 'Lost — tap to re-lock' : (f.follow ? 'Following' : 'Locked')),
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+            style: TextStyle(color: lost ? const Color(0xFFF59E0B) : Colors.white70, fontSize: 12, fontWeight: FontWeight.w600),
+          ),
+        ),
+        ...shots.map((s) => Padding(
+              padding: const EdgeInsets.only(left: 6),
+              child: _pill(s.$1, (f.shotZoom - s.$2).abs() < 0.01, () { _camera.smartSetShot(s.$2); setState(() {}); }),
+            )),
+        const SizedBox(width: 10),
+        _pill(f.follow ? 'Follow ✓' : 'Follow', f.follow, () { _camera.smartSetFollow(!f.follow); setState(() {}); }),
+        const SizedBox(width: 6),
+        if (active) _pill('Release ✕', false, () { _camera.smartRelease(); setState(() {}); }),
+      ]),
+    );
+  }
+
+  /// Live switcher: every camera the desktop can put on air (USB, IP, phones),
+  /// plus the transition used for the cut.
+  Widget _buildSwitcher() {
+    return Consumer<ConnectionService>(builder: (_, conn, __) {
+      final cams = conn.desktopCameras;
+      return Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.start, children: [
+        SizedBox(
+          height: 46,
+          child: cams.isEmpty
+              ? const Center(child: Text('No cameras reported by the desktop yet', style: TextStyle(color: Colors.white54, fontSize: 12)))
+              : ListView(
+                  scrollDirection: Axis.horizontal,
+                  children: cams.map((c) {
+                    final live = conn.activeCameraId == c.id;
+                    final self = c.id == conn.selfCameraId;
+                    final icon = c.kind == 'ip' ? Icons.router : (c.kind == 'mobile' || c.kind == 'webrtc') ? Icons.smartphone : Icons.videocam;
+                    return Padding(
+                      padding: const EdgeInsets.only(right: 8, top: 4, bottom: 4),
+                      child: GestureDetector(
+                        onTap: () => conn.selectDesktopCamera(c.id),
+                        child: AnimatedContainer(
+                          duration: const Duration(milliseconds: 200),
+                          padding: const EdgeInsets.symmetric(horizontal: 12),
+                          decoration: BoxDecoration(
+                            color: live ? const Color(0xFFDC2626) : const Color(0xCC141423),
+                            borderRadius: BorderRadius.circular(10),
+                            border: Border.all(color: live ? const Color(0xFFEF4444) : (self ? _purple : Colors.white24), width: live || self ? 1.5 : 1),
+                          ),
+                          child: Row(mainAxisSize: MainAxisSize.min, children: [
+                            Icon(icon, color: Colors.white, size: 16),
+                            const SizedBox(width: 6),
+                            Text(self ? 'This phone' : c.label,
+                                style: TextStyle(color: Colors.white, fontSize: 12, fontWeight: live ? FontWeight.w800 : FontWeight.w500)),
+                            if (live) ...[
+                              const SizedBox(width: 6),
+                              const Text('LIVE', style: TextStyle(color: Colors.white, fontSize: 10, fontWeight: FontWeight.w900)),
+                            ],
+                          ]),
+                        ),
+                      ),
+                    );
+                  }).toList(),
+                ),
+        ),
+        if (conn.transitions.isNotEmpty)
+          SizedBox(
+            height: 38,
+            child: ListView(
+              scrollDirection: Axis.horizontal,
+              children: conn.transitions.map((t) => Padding(
+                    padding: const EdgeInsets.only(right: 6, top: 4, bottom: 4),
+                    child: _pill(t.labelAr.isNotEmpty ? t.labelAr : t.label, conn.switchTransition == t.id, () => conn.setSwitchTransition(t.id)),
+                  )).toList(),
+            ),
+          ),
+      ]);
+    });
+  }
+
+  Widget _miniBtn(IconData icon, VoidCallback onTap) => GestureDetector(
+        onTap: onTap,
+        child: Container(
+          width: 34, height: 34,
+          decoration: const BoxDecoration(color: Color(0xBF141423), shape: BoxShape.circle),
+          child: Icon(icon, color: Colors.white, size: 18),
+        ),
+      );
+
+  Widget _pill(String label, bool active, VoidCallback onTap) => GestureDetector(
+        onTap: onTap,
+        child: Container(
+          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+          decoration: BoxDecoration(
+            color: active ? _purple : const Color(0xBF141423),
+            borderRadius: BorderRadius.circular(14),
+            border: Border.all(color: active ? _purple : Colors.white24),
+          ),
+          child: Text(label, style: TextStyle(color: active ? Colors.black : Colors.white, fontSize: 12, fontWeight: FontWeight.w700)),
+        ),
+      );
 
   Widget _filterSlider(String label, double value, double min, double max, ValueChanged<double> onChanged) => Row(children: [
         SizedBox(width: 80, child: Text(label, style: const TextStyle(color: Colors.white70, fontSize: 11))),
@@ -576,6 +892,63 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
           ElevatedButton(onPressed: _disconnect, child: const Text('← Back')),
         ]),
       ));
+}
+
+/// Draws the Smart Zoom program frame over the full camera preview: everything
+/// outside the crop is dimmed, the crop gets broadcast-style corner marks, and
+/// the followed person gets a marker (amber when the tracker has lost them).
+class _FramingPainter extends CustomPainter {
+  final CameraService camera;
+  final Rect frameRect;
+  final bool showFrame;
+  _FramingPainter({required this.camera, required this.frameRect, required this.showFrame})
+      : super(repaint: camera.framingTick);
+
+  Offset _toScreen(Offset p) => Offset(frameRect.left + p.dx * frameRect.width, frameRect.top + p.dy * frameRect.height);
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    if (!showFrame) return;
+    final f = camera.framer;
+    final c = f.crop;
+    final r = Rect.fromPoints(_toScreen(c.topLeft), _toScreen(c.bottomRight));
+
+    if (!f.isIdentity) {
+      final dim = Paint()..color = const Color(0x8C000000);
+      final outer = Path()..addRect(Offset.zero & size);
+      final hole = Path()..addRect(r);
+      canvas.drawPath(Path.combine(PathOperation.difference, outer, hole), dim);
+    }
+
+    // Corner marks.
+    final cornerPaint = Paint()
+      ..color = f.locked ? const Color(0xFFFFFFFF) : const Color(0xAAFFFFFF)
+      ..strokeWidth = 3
+      ..style = PaintingStyle.stroke;
+    final len = math.min(r.width, r.height) * 0.12;
+    for (final corner in [r.topLeft, r.topRight, r.bottomLeft, r.bottomRight]) {
+      final sx = corner.dx == r.left ? 1.0 : -1.0;
+      final sy = corner.dy == r.top ? 1.0 : -1.0;
+      canvas.drawLine(corner, corner + Offset(len * sx, 0), cornerPaint);
+      canvas.drawLine(corner, corner + Offset(0, len * sy), cornerPaint);
+    }
+
+    final s = f.subject;
+    if (f.locked && s != null) {
+      final lost = camera.tracker.lost;
+      final p = _toScreen(s);
+      final mark = Paint()
+        ..color = lost ? const Color(0xFFF59E0B) : const Color(0xFF22C55E)
+        ..strokeWidth = 2.5
+        ..style = PaintingStyle.stroke;
+      canvas.drawCircle(p, 18, mark);
+      canvas.drawCircle(p, 3, mark..style = PaintingStyle.fill);
+    }
+  }
+
+  @override
+  bool shouldRepaint(covariant _FramingPainter old) =>
+      old.frameRect != frameRect || old.showFrame != showFrame || old.camera != camera;
 }
 
 class _FocusRing extends StatefulWidget {

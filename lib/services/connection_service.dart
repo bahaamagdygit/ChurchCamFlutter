@@ -33,6 +33,14 @@ class DesktopCamera {
   const DesktopCamera({required this.id, required this.label, this.kind = ''});
 }
 
+/// A camera-switch transition offered by the desktop.
+class TransitionOption {
+  final String id;
+  final String label;
+  final String labelAr;
+  const TransitionOption({required this.id, required this.label, this.labelAr = ''});
+}
+
 void _log(String message) {
   if (kDebugMode) print('[ConnectionService] $message');
 }
@@ -104,6 +112,9 @@ class ConnectionService extends ChangeNotifier {
   // Desktop state (from welcome / desktop_state).
   List<DesktopCamera> _desktopCameras = const [];
   String _activeCameraLabel = '';
+  String _activeCameraId = '';
+  String _switchTransition = '';
+  List<TransitionOption> _transitions = const [];
   bool _streamLive = false;
   bool _recording = false;
 
@@ -122,6 +133,14 @@ class ConnectionService extends ChangeNotifier {
   bool get isVideoReady => _videoSocket != null && _videoHeaderSent;
   List<DesktopCamera> get desktopCameras => _desktopCameras;
   String get activeCameraLabel => _activeCameraLabel;
+  /// Switch id of the camera currently on air ('usb:…', 'ip:…', 'mobile:…').
+  String get activeCameraId => _activeCameraId;
+  /// Switch id that means "this phone" on the desktop.
+  String get selfCameraId => _deviceId.isEmpty ? '' : 'mobile:$_deviceId';
+  /// True when THIS phone is the live program source (drives the tally light).
+  bool get isSelfLive => _deviceId.isNotEmpty && _activeCameraId == selfCameraId;
+  String get switchTransition => _switchTransition;
+  List<TransitionOption> get transitions => _transitions;
   bool get streamLive => _streamLive;
   bool get recording => _recording;
 
@@ -164,7 +183,19 @@ class ConnectionService extends ChangeNotifier {
   // onMobileControl): select_camera, set_zoom, toggle_text, next_slide,
   // prev_slide, start_stream, stop_stream, start_recording, stop_recording,
   // cut_to_black.
-  void selectDesktopCamera(String deviceId) => sendControl('select_camera', deviceId);
+  void selectDesktopCamera(String deviceId) {
+    // Optimistic: light the tally immediately; desktop_state confirms.
+    _activeCameraId = deviceId;
+    notifyListeners();
+    sendControl('select_camera', deviceId);
+  }
+  void setSwitchTransition(String id) {
+    _switchTransition = id;
+    notifyListeners();
+    sendControl('set_transition', id);
+  }
+  /// Phone → desktop live state (zoom, Smart Zoom status) for the desktop UI.
+  void sendPhoneState(Map<String, dynamic> state) => _send({'type': 'phone_state', 'value': state});
   void desktopZoom(double zoom) => sendControl('set_zoom', zoom);
   void toggleReadingOverlay(bool visible) => sendControl('toggle_text', visible);
   void nextSlide() => sendControl('next_slide');
@@ -365,6 +396,19 @@ class ConnectionService extends ChangeNotifier {
           if (v['streamStatus'] != null) _streamLive = v['streamStatus'] == 'live';
           if (v['recordingStatus'] != null) _recording = v['recordingStatus'] == 'recording';
           if (v['activeCameraLabel'] != null) _activeCameraLabel = v['activeCameraLabel'].toString();
+          if (v['activeCameraId'] != null) _activeCameraId = v['activeCameraId'].toString();
+          if (v['switchTransition'] != null) _switchTransition = v['switchTransition'].toString();
+          if (v['transitions'] is List) {
+            _transitions = (v['transitions'] as List)
+                .whereType<Map>()
+                .map((m) => TransitionOption(
+                      id: (m['id'] ?? '').toString(),
+                      label: (m['label'] ?? '').toString(),
+                      labelAr: (m['labelAr'] ?? '').toString(),
+                    ))
+                .where((t) => t.id.isNotEmpty)
+                .toList();
+          }
           // Live list of every camera the desktop can switch to (usb:/ip: ids).
           if (v['availableCameras'] is List) {
             _desktopCameras = (v['availableCameras'] as List)

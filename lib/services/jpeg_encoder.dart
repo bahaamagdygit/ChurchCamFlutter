@@ -15,6 +15,12 @@ class RawFrame {
   final bool mirror; // flip horizontally (front camera)
   final int rotation; // degrees to rotate the JPEG (0/90/180/270) → upright
 
+  // Digital crop (Smart Zoom / digital zoom), normalized to the SOURCE frame
+  // (before mirror/rotation). Full frame = (0,0,1,1). Cropping from the raw
+  // sensor-resolution planes keeps zoomed shots far sharper than zooming the
+  // already-downscaled JPEG on the desktop.
+  final double cropX, cropY, cropW, cropH;
+
   // yuv420 planes
   final Uint8List? y, u, v;
   final int yRowStride, uvRowStride, uvPixelStride;
@@ -30,6 +36,10 @@ class RawFrame {
     required this.quality,
     required this.mirror,
     this.rotation = 0,
+    this.cropX = 0,
+    this.cropY = 0,
+    this.cropW = 1,
+    this.cropH = 1,
     this.y,
     this.u,
     this.v,
@@ -119,6 +129,15 @@ class JpegEncoder {
         bytes: f.bgra!.buffer,
         order: img.ChannelOrder.bgra,
       );
+      if (f.cropW < 0.999 || f.cropH < 0.999) {
+        rgb = img.copyCrop(
+          rgb,
+          x: (f.cropX * f.width).round(),
+          y: (f.cropY * f.height).round(),
+          width: (f.cropW * f.width).round().clamp(2, f.width),
+          height: (f.cropH * f.height).round().clamp(2, f.height),
+        );
+      }
       final longest = rgb.width > rgb.height ? rgb.width : rgb.height;
       if (longest > f.maxWidth) {
         final scale = f.maxWidth / longest;
@@ -146,24 +165,44 @@ class JpegEncoder {
   /// that map to an output pixel, using integer math (no float multiplies per px).
   static img.Image _yuvToImageScaled(RawFrame f) {
     final sw = f.width, sh = f.height;
-    final longest = sw > sh ? sw : sh;
-    // Integer downscale factor (1,2,3,…) so the longest edge ≤ maxWidth.
-    int step = 1;
-    while (longest ~/ step > f.maxWidth) {
-      step++;
+    // Crop region in source pixels (clamped, even-aligned for chroma). The full
+    // frame when no digital zoom is active.
+    final x0 = (f.cropX * sw).floor().clamp(0, sw - 2) & ~1;
+    final y0 = (f.cropY * sh).floor().clamp(0, sh - 2) & ~1;
+    final rw = (f.cropW * sw).round().clamp(2, sw - x0);
+    final rh = (f.cropH * sh).round().clamp(2, sh - y0);
+
+    // Output size. Uncropped keeps the old integer-step downscale (identical
+    // output to before). Cropped regions are never upscaled here — the desktop
+    // upscales with bilinear filtering, which looks better than nearest.
+    int ow, oh;
+    final longest = rw > rh ? rw : rh;
+    if (rw == sw && rh == sh) {
+      int step = 1;
+      while (longest ~/ step > f.maxWidth) {
+        step++;
+      }
+      ow = sw ~/ step;
+      oh = sh ~/ step;
+    } else {
+      final scale = longest > f.maxWidth ? f.maxWidth / longest : 1.0;
+      ow = (rw * scale).round().clamp(2, sw);
+      oh = (rh * scale).round().clamp(2, sh);
     }
-    final ow = sw ~/ step, oh = sh ~/ step;
     final out = img.Image(width: ow, height: oh);
+
+    // Precomputed source column per output column → pure lookups in the loop.
+    final colSrc = List<int>.generate(ow, (ox) => x0 + (ox * rw) ~/ ow);
 
     final yB = f.y!, uB = f.u!, vB = f.v!;
     final yrs = f.yRowStride, uvrs = f.uvRowStride, uvps = f.uvPixelStride;
 
     for (int oy = 0; oy < oh; oy++) {
-      final sy = oy * step;
+      final sy = y0 + (oy * rh) ~/ oh;
       final yRow = sy * yrs;
       final uvRow = (sy >> 1) * uvrs;
       for (int ox = 0; ox < ow; ox++) {
-        final sx = ox * step;
+        final sx = colSrc[ox];
         final yIdx = yRow + sx;
         final uvIdx = uvRow + (sx >> 1) * uvps;
         if (yIdx >= yB.length || uvIdx >= uB.length || uvIdx >= vB.length) {

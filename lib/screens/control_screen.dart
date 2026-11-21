@@ -46,17 +46,39 @@ class _ControlScreenState extends State<ControlScreen> {
               )
             else
               ...cams.map((c) {
-                // The desktop reports the ACTIVE camera by label; match against it,
-                // and also treat a locally-tapped selection as active immediately.
-                final isLive = _selectedDesktopCam == c.id ||
-                    (_selectedDesktopCam == null && c.label == conn.activeCameraLabel);
-                return _cameraRow(c, isLive, () {
+                // The desktop reports the on-air camera by id; fall back to the
+                // label for older desktops that don't send it.
+                final isLive = conn.activeCameraId.isNotEmpty
+                    ? conn.activeCameraId == c.id
+                    : (_selectedDesktopCam == c.id ||
+                        (_selectedDesktopCam == null && c.label == conn.activeCameraLabel));
+                final shown = c.id == conn.selfCameraId
+                    ? DesktopCamera(id: c.id, label: '${c.label} (this phone)', kind: c.kind)
+                    : c;
+                return _cameraRow(shown, isLive, () {
                   setState(() => _selectedDesktopCam = c.id);
                   conn.selectDesktopCamera(c.id);
                 });
               }),
+            if (conn.transitions.isNotEmpty) ...[
+              const SizedBox(height: 8),
+              const Text('Transition', style: TextStyle(color: Color(0xFFAAAAAA), fontSize: 13)),
+              const SizedBox(height: 6),
+              Wrap(spacing: 6, runSpacing: 6, children: conn.transitions.map((t) {
+                final on = conn.switchTransition == t.id;
+                return ChoiceChip(
+                  label: Text(t.labelAr.isNotEmpty ? '${t.label} · ${t.labelAr}' : t.label),
+                  selected: on,
+                  selectedColor: const Color(0x55818CF8),
+                  backgroundColor: const Color(0xFF07070F),
+                  side: BorderSide(color: on ? _purple : _border),
+                  labelStyle: TextStyle(color: on ? Colors.white : Colors.white70, fontSize: 12),
+                  onSelected: (_) => conn.setSwitchTransition(t.id),
+                );
+              }).toList()),
+            ],
             const SizedBox(height: 12),
-            _labeled('Desktop zoom  ${_desktopZoom.toStringAsFixed(1)}×', Slider(
+            _labeled('Live camera zoom  ${_desktopZoom.toStringAsFixed(1)}×', Slider(
               value: _desktopZoom, min: 1, max: 4, divisions: 30, activeColor: _purple,
               onChanged: (v) => setState(() => _desktopZoom = v),
               onChangeEnd: (v) => conn.desktopZoom(v),
