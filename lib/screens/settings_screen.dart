@@ -1,22 +1,22 @@
 import 'package:flutter/material.dart';
+import 'package:phosphor_flutter/phosphor_flutter.dart';
 import 'package:provider/provider.dart';
 import '../services/connection_service.dart';
 import '../services/storage.dart';
-import '../widgets/connection_badge.dart';
+import '../ui/tokens.dart';
+import '../ui/components.dart';
 
-const _purple = Color(0xFF818CF8);
-const _card = Color(0xFF111120);
-const _border = Color(0xFF1E1E35);
-
-/// Settings (Section 9). Persists via shared_preferences.
-class SettingsScreen extends StatefulWidget {
-  const SettingsScreen({super.key});
+/// Settings tab (side panel). Every change persists immediately via
+/// shared_preferences — there's no Save button to forget.
+class SettingsPanel extends StatefulWidget {
+  final VoidCallback onDisconnect;
+  const SettingsPanel({super.key, required this.onDisconnect});
 
   @override
-  State<SettingsScreen> createState() => _SettingsScreenState();
+  State<SettingsPanel> createState() => _SettingsPanelState();
 }
 
-class _SettingsScreenState extends State<SettingsScreen> {
+class _SettingsPanelState extends State<SettingsPanel> {
   AppSettings _s = const AppSettings();
   final _nameCtrl = TextEditingController();
   final _wsCtrl = TextEditingController();
@@ -24,7 +24,6 @@ class _SettingsScreenState extends State<SettingsScreen> {
   String _resolution = '1080p';
   int _fps = 30;
 
-  // Full ladder. Each label maps to a longest-edge px in _longEdgeFor().
   static const _resolutions = ['360p', '480p', '720p', '1080p', '2K', '4K'];
   static const _fpsOptions = [30, 60];
 
@@ -38,6 +37,15 @@ class _SettingsScreenState extends State<SettingsScreen> {
       case '360p': return 640;
       default: return 1920;
     }
+  }
+
+  static String _labelForLongEdge(int e) {
+    if (e >= 3840) return '4K';
+    if (e >= 2560) return '2K';
+    if (e >= 1920) return '1080p';
+    if (e >= 1280) return '720p';
+    if (e >= 854) return '480p';
+    return '360p';
   }
 
   @override
@@ -54,15 +62,6 @@ class _SettingsScreenState extends State<SettingsScreen> {
         _fps = s.videoFps;
       });
     });
-  }
-
-  static String _labelForLongEdge(int e) {
-    if (e >= 3840) return '4K';
-    if (e >= 2560) return '2K';
-    if (e >= 1920) return '1080p';
-    if (e >= 1280) return '720p';
-    if (e >= 854) return '480p';
-    return '360p';
   }
 
   Future<void> _persist() async {
@@ -86,125 +85,144 @@ class _SettingsScreenState extends State<SettingsScreen> {
 
   @override
   Widget build(BuildContext context) {
-    final conn = context.read<ConnectionService>();
-    return Scaffold(
-      backgroundColor: const Color(0xFF07070F),
-      appBar: AppBar(
-        backgroundColor: const Color(0xFF0E0E1F),
-        title: const Text('Settings'),
-        actions: const [Padding(padding: EdgeInsets.only(right: 12), child: Center(child: ConnectionBadge()))],
-      ),
-      body: ListView(
-        padding: const EdgeInsets.all(16),
+    final conn = context.watch<ConnectionService>();
+    return Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+      PanelSection(
+        title: 'This camera',
         children: [
-          _section('Device', [
-            _field('Device name', _nameCtrl, onChanged: (_) => _persist()),
-          ]),
-
-          _section('Camera', [
-            _labeled('Resolution', DropdownButton<String>(
-              value: _resolution, isExpanded: true, dropdownColor: _card,
-              style: const TextStyle(color: Colors.white),
-              items: _resolutions.map((r) => DropdownMenuItem(value: r, child: Text(r))).toList(),
-              onChanged: (v) async {
-                if (v == null) return;
-                setState(() => _resolution = v);
-                await _persist();
-              },
-            )),
-            const SizedBox(height: 8),
-            _labeled('Frame rate', DropdownButton<int>(
-              value: _fps, isExpanded: true, dropdownColor: _card,
-              style: const TextStyle(color: Colors.white),
-              items: _fpsOptions.map((f) => DropdownMenuItem(value: f, child: Text('$f fps'))).toList(),
-              onChanged: (v) async {
-                if (v == null) return;
-                setState(() => _fps = v);
-                await _persist();
-              },
-            )),
-            const SizedBox(height: 8),
-            const Text('4K/60fps need a capable phone + strong Wi-Fi. If video '
-                'stutters, drop to 1080p/30.',
-                style: TextStyle(color: Colors.white38, fontSize: 11)),
-            const SizedBox(height: 8),
-            _toggleRow('Preferred camera: ${_s.preferredPosition == 'front' ? 'Front' : 'Back'}',
-                _s.preferredPosition == 'front', (v) async {
-              setState(() => _s = _s.copyWith(preferredPosition: v ? 'front' : 'back'));
-              await _persist();
-            }),
-            _toggleRow('Enable audio', _s.audioEnabled, (v) async {
-              setState(() => _s = _s.copyWith(audioEnabled: v));
-              await _persist();
-            }),
-          ]),
-
-          _section('Connection ports', [
-            Row(children: [
-              Expanded(child: _field('WebSocket', _wsCtrl, number: true, onChanged: (_) => _persist())),
-              const SizedBox(width: 12),
-              Expanded(child: _field('TCP video', _tcpCtrl, number: true, onChanged: (_) => _persist())),
-            ]),
-          ]),
-
-          const SizedBox(height: 8),
-          ElevatedButton.icon(
-            style: ElevatedButton.styleFrom(backgroundColor: const Color(0xFF991B1B), padding: const EdgeInsets.symmetric(vertical: 16)),
-            icon: const Icon(Icons.link_off),
-            label: const Text('Disconnect'),
-            onPressed: () {
-              conn.disconnect();
-              Navigator.of(context).pushNamedAndRemoveUntil('/', (r) => false);
-            },
+          TextField(
+            controller: _nameCtrl,
+            onChanged: (_) => _persist(),
+            style: const TextStyle(color: C.text),
+            decoration: InputDecoration(
+              labelText: 'Name shown on the desktop',
+              prefixIcon: Padding(
+                padding: const EdgeInsets.all(12),
+                child: PhosphorIcon(PhosphorIconsRegular.tag, size: 18, color: C.textDim),
+              ),
+            ),
           ),
-
-          const SizedBox(height: 24),
-          _section('About', const [
-            Text('Church Cam · Flutter', style: TextStyle(color: Colors.white, fontWeight: FontWeight.w700)),
-            SizedBox(height: 4),
-            Text('Version 1.0.0  ·  LAN Studio Camera', style: TextStyle(color: Color(0xFF666666), fontSize: 13)),
+          const SizedBox(height: S.xs),
+          const Text('Takes effect next time you connect.', style: T.caption),
+        ],
+      ),
+      PanelSection(
+        title: 'Video quality',
+        children: [
+          Wrap(spacing: S.sm, runSpacing: S.sm, children: _resolutions.map((r) => Choice(
+                label: r,
+                selected: _resolution == r,
+                onTap: () { setState(() => _resolution = r); _persist(); },
+              )).toList()),
+          const SizedBox(height: S.md),
+          Wrap(spacing: S.sm, children: _fpsOptions.map((f) => Choice(
+                label: '$f fps',
+                icon: f == 60 ? PhosphorIconsRegular.lightning : PhosphorIconsRegular.filmStrip,
+                selected: _fps == f,
+                onTap: () { setState(() => _fps = f); _persist(); },
+              )).toList()),
+          const SizedBox(height: S.sm),
+          Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
+            PhosphorIcon(PhosphorIconsRegular.info, size: 16, color: C.textFaint),
+            const SizedBox(width: 6),
+            const Expanded(child: Text('4K and 60 fps need a capable phone and strong Wi-Fi. If the picture stutters, use 1080p at 30 fps.', style: T.caption)),
           ]),
+        ],
+      ),
+      PanelSection(
+        title: 'Camera',
+        children: [
+          PanelTile(
+            icon: PhosphorIconsRegular.cameraRotate,
+            title: 'Start with',
+            subtitle: _s.preferredPosition == 'front' ? 'Front camera' : 'Back camera',
+            trailing: Switch(
+              value: _s.preferredPosition == 'front',
+              onChanged: (v) async {
+                setState(() => _s = _s.copyWith(preferredPosition: v ? 'front' : 'back'));
+                await _persist();
+              },
+            ),
+          ),
+          PanelTile(
+            icon: _s.audioEnabled ? PhosphorIconsRegular.microphone : PhosphorIconsRegular.microphoneSlash,
+            title: 'Audio',
+            subtitle: _s.audioEnabled ? 'Sending microphone audio' : 'Video only',
+            trailing: Switch(
+              value: _s.audioEnabled,
+              onChanged: (v) async {
+                setState(() => _s = _s.copyWith(audioEnabled: v));
+                await _persist();
+              },
+            ),
+          ),
+        ],
+      ),
+      PanelSection(
+        title: 'Connection',
+        children: [
+          PanelTile(
+            icon: PhosphorIconsRegular.desktop,
+            title: conn.status == ConnectionStatus.connected ? 'Connected to studio' : 'Not connected',
+            subtitle: conn.status == ConnectionStatus.connected ? 'Latency ${conn.latencyMs} ms' : null,
+            highlighted: conn.status == ConnectionStatus.connected,
+            highlightColor: C.ok,
+          ),
+          const SizedBox(height: S.xs),
+          Row(children: [
+            Expanded(child: _portField('Control port', _wsCtrl)),
+            const SizedBox(width: S.sm),
+            Expanded(child: _portField('Video port', _tcpCtrl)),
+          ]),
+          const SizedBox(height: S.md),
+          SizedBox(
+            width: double.infinity,
+            height: 48,
+            child: OutlinedButton.icon(
+              style: OutlinedButton.styleFrom(
+                foregroundColor: C.tally,
+                side: const BorderSide(color: Color(0x66FF3B30)),
+                shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(R.md)),
+              ),
+              onPressed: () => _confirmDisconnect(context),
+              icon: PhosphorIcon(PhosphorIconsBold.plugs, size: 18, color: C.tally),
+              label: const Text('Disconnect from studio', style: TextStyle(fontWeight: FontWeight.w700)),
+            ),
+          ),
+        ],
+      ),
+      Row(children: [
+        PhosphorIcon(PhosphorIconsFill.aperture, size: 16, color: C.textFaint),
+        const SizedBox(width: 6),
+        const Text('Church Cam  ·  v1.0.0', style: T.caption),
+      ]),
+    ]);
+  }
+
+  Widget _portField(String label, TextEditingController ctrl) => TextField(
+        controller: ctrl,
+        onChanged: (_) => _persist(),
+        keyboardType: TextInputType.number,
+        style: const TextStyle(color: C.text, fontFeatures: [FontFeature.tabularFigures()]),
+        decoration: InputDecoration(labelText: label),
+      );
+
+  Future<void> _confirmDisconnect(BuildContext context) async {
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Disconnect from the studio?', style: T.title),
+        content: const Text('This phone stops sending video. If it is on air, the desktop switches away from it.', style: T.body),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('Stay connected')),
+          FilledButton(
+            style: FilledButton.styleFrom(backgroundColor: C.tally, foregroundColor: Colors.white),
+            onPressed: () => Navigator.pop(ctx, true),
+            child: const Text('Disconnect'),
+          ),
         ],
       ),
     );
+    if (ok == true) widget.onDisconnect();
   }
-
-  Widget _section(String title, List<Widget> children) => Container(
-        margin: const EdgeInsets.only(bottom: 16),
-        padding: const EdgeInsets.all(16),
-        decoration: BoxDecoration(color: _card, borderRadius: BorderRadius.circular(18), border: Border.all(color: _border)),
-        child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-          Text(title.toUpperCase(), style: const TextStyle(color: _purple, fontSize: 11, fontWeight: FontWeight.w700, letterSpacing: 1.3)),
-          const SizedBox(height: 12),
-          ...children,
-        ]),
-      );
-
-  Widget _labeled(String label, Widget child) => Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [Text(label, style: const TextStyle(color: Color(0xFFAAAAAA), fontSize: 13)), child],
-      );
-
-  Widget _field(String label, TextEditingController ctrl, {bool number = false, ValueChanged<String>? onChanged}) => _labeled(
-        label,
-        TextField(
-          controller: ctrl,
-          onChanged: onChanged,
-          keyboardType: number ? TextInputType.number : TextInputType.text,
-          style: const TextStyle(color: Colors.white),
-          decoration: const InputDecoration(
-            isDense: true,
-            enabledBorder: UnderlineInputBorder(borderSide: BorderSide(color: _border)),
-            focusedBorder: UnderlineInputBorder(borderSide: BorderSide(color: _purple)),
-          ),
-        ),
-      );
-
-  Widget _toggleRow(String label, bool value, ValueChanged<bool> onChanged) => Row(
-        mainAxisAlignment: MainAxisAlignment.spaceBetween,
-        children: [
-          Expanded(child: Text(label, style: const TextStyle(color: Colors.white))),
-          Switch(value: value, activeColor: _purple, onChanged: onChanged),
-        ],
-      );
 }

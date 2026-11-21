@@ -1,225 +1,199 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+import 'package:phosphor_flutter/phosphor_flutter.dart';
 import 'package:provider/provider.dart';
 import '../services/connection_service.dart';
-import '../widgets/connection_badge.dart';
+import '../ui/tokens.dart';
+import '../ui/components.dart';
 
-const _purple = Color(0xFF818CF8);
-const _card = Color(0xFF111120);
-const _border = Color(0xFF1E1E35);
-
-/// Remote control of the desktop (Section 9 — Control screen).
-class ControlScreen extends StatefulWidget {
-  const ControlScreen({super.key});
+/// Studio tab: remote control of the desktop (stream, recording, slides,
+/// reading text, cut to black, live camera zoom). Lives in the camera screen's
+/// side panel so the operator never leaves the viewfinder.
+class StudioPanel extends StatefulWidget {
+  const StudioPanel({super.key});
 
   @override
-  State<ControlScreen> createState() => _ControlScreenState();
+  State<StudioPanel> createState() => _StudioPanelState();
 }
 
-class _ControlScreenState extends State<ControlScreen> {
-  String? _selectedDesktopCam;
-  double _desktopZoom = 1.0;
+class _StudioPanelState extends State<StudioPanel> {
+  double _liveZoom = 1.0;
   bool _cutToBlack = false;
   bool _overlayVisible = false;
 
   @override
   Widget build(BuildContext context) {
     final conn = context.watch<ConnectionService>();
-    final cams = conn.desktopCameras;
-
-    return Scaffold(
-      backgroundColor: const Color(0xFF07070F),
-      appBar: AppBar(
-        backgroundColor: const Color(0xFF0E0E1F),
-        title: const Text('Control'),
-        actions: const [Padding(padding: EdgeInsets.only(right: 12), child: Center(child: ConnectionBadge()))],
-      ),
-      body: ListView(
-        padding: const EdgeInsets.all(16),
+    return Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+      PanelSection(
+        title: 'Output',
         children: [
-          // ── Live cameras: tap one to put it live on the desktop ──
-          _section('Live Cameras', [
-            if (cams.isEmpty)
-              const Padding(
-                padding: EdgeInsets.symmetric(vertical: 8),
-                child: Text('No cameras reported by the desktop yet.',
-                    style: TextStyle(color: Color(0xFF666666))),
-              )
-            else
-              ...cams.map((c) {
-                // The desktop reports the on-air camera by id; fall back to the
-                // label for older desktops that don't send it.
-                final isLive = conn.activeCameraId.isNotEmpty
-                    ? conn.activeCameraId == c.id
-                    : (_selectedDesktopCam == c.id ||
-                        (_selectedDesktopCam == null && c.label == conn.activeCameraLabel));
-                final shown = c.id == conn.selfCameraId
-                    ? DesktopCamera(id: c.id, label: '${c.label} (this phone)', kind: c.kind)
-                    : c;
-                return _cameraRow(shown, isLive, () {
-                  setState(() => _selectedDesktopCam = c.id);
-                  conn.selectDesktopCamera(c.id);
-                });
-              }),
-            if (conn.transitions.isNotEmpty) ...[
-              const SizedBox(height: 8),
-              const Text('Transition', style: TextStyle(color: Color(0xFFAAAAAA), fontSize: 13)),
-              const SizedBox(height: 6),
-              Wrap(spacing: 6, runSpacing: 6, children: conn.transitions.map((t) {
-                final on = conn.switchTransition == t.id;
-                return ChoiceChip(
-                  label: Text(t.labelAr.isNotEmpty ? '${t.label} · ${t.labelAr}' : t.label),
-                  selected: on,
-                  selectedColor: const Color(0x55818CF8),
-                  backgroundColor: const Color(0xFF07070F),
-                  side: BorderSide(color: on ? _purple : _border),
-                  labelStyle: TextStyle(color: on ? Colors.white : Colors.white70, fontSize: 12),
-                  onSelected: (_) => conn.setSwitchTransition(t.id),
-                );
-              }).toList()),
-            ],
-            const SizedBox(height: 12),
-            _labeled('Live camera zoom  ${_desktopZoom.toStringAsFixed(1)}×', Slider(
-              value: _desktopZoom, min: 1, max: 4, divisions: 30, activeColor: _purple,
-              onChanged: (v) => setState(() => _desktopZoom = v),
-              onChangeEnd: (v) => conn.desktopZoom(v),
+          Row(children: [
+            Expanded(child: _BigAction(
+              icon: PhosphorIconsFill.broadcast,
+              label: conn.streamLive ? 'Stop stream' : 'Go live',
+              status: conn.streamLive ? 'LIVE' : 'Offline',
+              active: conn.streamLive,
+              onTap: () => conn.streamLive ? _confirm(context, 'Stop the live stream?', 'Viewers will see the stream end.', conn.stopStream) : conn.startStream(),
             )),
-            Wrap(spacing: 8, runSpacing: 8, children: [
-              _chip(Icons.flip_camera_android, 'Flip', () => conn.sendControl('flip')),
-              _chip(Icons.flash_on, 'Torch', () => conn.sendControl('torch')),
-              _chip(Icons.center_focus_strong, 'Focus reset', () => conn.sendControl('focus_reset')),
-              _toggleChip(Icons.dark_mode, 'Cut to black', _cutToBlack, () {
-                setState(() => _cutToBlack = !_cutToBlack);
-                conn.cutToBlack(_cutToBlack);
-              }),
-            ]),
+            const SizedBox(width: S.sm),
+            Expanded(child: _BigAction(
+              icon: PhosphorIconsFill.record,
+              label: conn.recording ? 'Stop recording' : 'Record',
+              status: conn.recording ? 'REC' : 'Not recording',
+              active: conn.recording,
+              onTap: () => conn.recording ? conn.stopRecording() : conn.startRecording(),
+            )),
           ]),
-
-          // ── Stream ──
-          _section('Stream', [
-            Row(children: [
-              Expanded(child: _bigBtn('● Start Stream', const Color(0xFF4F46E5), conn.streamLive, () => conn.startStream())),
-              const SizedBox(width: 10),
-              Expanded(child: _bigBtn('■ Stop Stream', const Color(0xFF991B1B), !conn.streamLive, () => conn.stopStream())),
-            ]),
-            const SizedBox(height: 6),
-            Text(conn.streamLive ? '🔴 LIVE' : 'Offline',
-                style: TextStyle(color: conn.streamLive ? const Color(0xFFEF4444) : const Color(0xFF666666), fontWeight: FontWeight.bold)),
-            const SizedBox(height: 12),
-            Row(children: [
-              Expanded(child: _bigBtn('⏺ Start Rec', const Color(0xFF4F46E5), conn.recording, () => conn.startRecording())),
-              const SizedBox(width: 10),
-              Expanded(child: _bigBtn('⏹ Stop Rec', const Color(0xFF991B1B), !conn.recording, () => conn.stopRecording())),
-            ]),
-            const SizedBox(height: 6),
-            Text(conn.recording ? '⏺ Recording' : 'Not recording',
-                style: TextStyle(color: conn.recording ? const Color(0xFFEF4444) : const Color(0xFF666666), fontWeight: FontWeight.bold)),
-          ]),
-
-          // ── Slides ──
-          _section('Slides', [
-            Row(children: [
-              Expanded(child: _bigBtn('◀ Previous', _card, false, () => conn.prevSlide())),
-              const SizedBox(width: 10),
-              Expanded(child: _bigBtn('Next ▶', _card, false, () => conn.nextSlide())),
-            ]),
-            const SizedBox(height: 10),
-            Container(
-              width: double.infinity,
-              padding: const EdgeInsets.all(14),
-              decoration: BoxDecoration(color: const Color(0xFF07070F), borderRadius: BorderRadius.circular(12), border: Border.all(color: _border)),
-              child: Text(conn.readingText.isEmpty ? '—' : conn.readingText,
-                  textAlign: TextAlign.center, style: const TextStyle(color: Colors.white, fontSize: 16)),
-            ),
-          ]),
-
-          // ── Overlay ──
-          _section('Overlay', [
-            _toggleChip(Icons.subtitles, _overlayVisible ? 'Reading text: ON' : 'Reading text: OFF', _overlayVisible, () {
-              setState(() => _overlayVisible = !_overlayVisible);
-              conn.toggleReadingOverlay(_overlayVisible);
+          const SizedBox(height: S.sm),
+          PanelTile(
+            icon: PhosphorIconsRegular.monitor,
+            title: 'Cut to black',
+            subtitle: _cutToBlack ? 'Fallback picture on air' : 'Live camera on air',
+            highlighted: _cutToBlack, highlightColor: C.warn,
+            trailing: Switch(value: _cutToBlack, onChanged: (v) {
+              setState(() => _cutToBlack = v);
+              conn.cutToBlack(v);
             }),
+          ),
+        ],
+      ),
+      PanelSection(
+        title: 'Slides & reading',
+        children: [
+          Container(
+            width: double.infinity,
+            constraints: const BoxConstraints(minHeight: 64),
+            padding: const EdgeInsets.all(S.md),
+            decoration: BoxDecoration(color: C.surface2, borderRadius: BorderRadius.circular(R.md), border: Border.all(color: C.border)),
+            child: Text(
+              conn.readingText.isEmpty ? 'No reading text is showing right now.' : conn.readingText,
+              textAlign: TextAlign.center,
+              style: conn.readingText.isEmpty ? T.body : const TextStyle(color: C.text, fontSize: 15, fontWeight: FontWeight.w600, height: 1.35),
+            ),
+          ),
+          const SizedBox(height: S.sm),
+          Row(children: [
+            Expanded(child: _StepButton(icon: PhosphorIconsBold.caretLeft, label: 'Previous', onTap: conn.prevSlide)),
+            const SizedBox(width: S.sm),
+            Expanded(child: _StepButton(icon: PhosphorIconsBold.caretRight, label: 'Next', onTap: conn.nextSlide, trailingIcon: true)),
           ]),
+          const SizedBox(height: S.sm),
+          PanelTile(
+            icon: PhosphorIconsRegular.textAa,
+            title: 'Show reading text',
+            subtitle: _overlayVisible ? 'Visible to viewers' : 'Hidden',
+            highlighted: _overlayVisible,
+            trailing: Switch(value: _overlayVisible, onChanged: (v) {
+              setState(() => _overlayVisible = v);
+              conn.toggleReadingOverlay(v);
+            }),
+          ),
+        ],
+      ),
+      PanelSection(
+        title: 'On-air camera zoom',
+        children: [
+          ValueSlider(
+            icon: PhosphorIconsRegular.magnifyingGlassPlus,
+            label: 'Zoom', value: _liveZoom, min: 1, max: 4, neutral: 1,
+            format: (v) => '${v.toStringAsFixed(1)}×',
+            onChanged: (v) => setState(() => _liveZoom = v),
+          ),
+          const Text('Applies to whichever camera is on air (USB, IP or a phone).', style: T.body),
+          Align(
+            alignment: Alignment.centerRight,
+            child: TextButton(onPressed: () => conn.desktopZoom(_liveZoom), child: const Text('Apply', style: TextStyle(color: C.accent, fontWeight: FontWeight.w700))),
+          ),
+        ],
+      ),
+    ]);
+  }
+
+  Future<void> _confirm(BuildContext context, String title, String body, VoidCallback action) async {
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: Text(title, style: T.title),
+        content: Text(body, style: T.body),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('Keep streaming')),
+          FilledButton(
+            style: FilledButton.styleFrom(backgroundColor: C.tally, foregroundColor: Colors.white),
+            onPressed: () => Navigator.pop(ctx, true),
+            child: const Text('Stop stream'),
+          ),
         ],
       ),
     );
+    if (ok == true) action();
   }
+}
 
-  Widget _section(String title, List<Widget> children) => Container(
-        margin: const EdgeInsets.only(bottom: 16),
-        padding: const EdgeInsets.all(16),
-        decoration: BoxDecoration(color: _card, borderRadius: BorderRadius.circular(18), border: Border.all(color: _border)),
-        child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-          Text(title.toUpperCase(), style: const TextStyle(color: _purple, fontSize: 11, fontWeight: FontWeight.w700, letterSpacing: 1.3)),
-          const SizedBox(height: 12),
-          ...children,
-        ]),
-      );
+/// Tall toggle button for stream / record: big icon, verb label, live status.
+class _BigAction extends StatelessWidget {
+  final IconData icon;
+  final String label;
+  final String status;
+  final bool active;
+  final VoidCallback onTap;
+  const _BigAction({required this.icon, required this.label, required this.status, required this.active, required this.onTap});
 
-  Widget _labeled(String label, Widget child) => Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [Text(label, style: const TextStyle(color: Color(0xFFAAAAAA), fontSize: 13)), child],
-      );
-
-  /// A selectable camera row — tap to put it live on the desktop.
-  Widget _cameraRow(DesktopCamera c, bool isLive, VoidCallback onTap) {
-    final icon = c.kind == 'ip' ? Icons.router
-        : c.kind == 'mobile' ? Icons.smartphone
-        : Icons.videocam;
-    return Padding(
-      padding: const EdgeInsets.only(bottom: 8),
-      child: InkWell(
-        borderRadius: BorderRadius.circular(12),
-        onTap: onTap,
-        child: Container(
-          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 12),
-          decoration: BoxDecoration(
-            color: isLive ? const Color(0x33818CF8) : const Color(0xFF07070F),
-            borderRadius: BorderRadius.circular(12),
-            border: Border.all(color: isLive ? _purple : _border, width: isLive ? 1.5 : 1),
+  @override
+  Widget build(BuildContext context) => Semantics(
+        button: true, label: label,
+        child: Material(
+          color: active ? C.tally : C.surface2,
+          borderRadius: BorderRadius.circular(R.md),
+          child: InkWell(
+            borderRadius: BorderRadius.circular(R.md),
+            onTap: () { HapticFeedback.mediumImpact(); onTap(); },
+            child: Container(
+              height: 92,
+              padding: const EdgeInsets.all(S.md),
+              decoration: BoxDecoration(
+                borderRadius: BorderRadius.circular(R.md),
+                border: Border.all(color: active ? C.tally : C.border),
+              ),
+              child: Column(crossAxisAlignment: CrossAxisAlignment.start, mainAxisAlignment: MainAxisAlignment.spaceBetween, children: [
+                PhosphorIcon(icon, size: 24, color: active ? Colors.white : C.tally),
+                Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                  Text(label, style: T.label.copyWith(color: active ? Colors.white : C.text)),
+                  Text(status, style: T.caption.copyWith(color: active ? Colors.white70 : C.textFaint)),
+                ]),
+              ]),
+            ),
           ),
-          child: Row(children: [
-            Icon(icon, color: isLive ? _purple : Colors.white70, size: 20),
-            const SizedBox(width: 12),
-            Expanded(child: Text(c.label,
-                maxLines: 1, overflow: TextOverflow.ellipsis,
-                style: TextStyle(color: Colors.white, fontWeight: isLive ? FontWeight.w700 : FontWeight.w500))),
-            if (isLive)
-              Container(
-                padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
-                decoration: BoxDecoration(color: const Color(0xFFEF4444), borderRadius: BorderRadius.circular(6)),
-                child: const Text('LIVE', style: TextStyle(color: Colors.white, fontSize: 10, fontWeight: FontWeight.w800)),
-              )
-            else
-              const Text('Tap to go live', style: TextStyle(color: _purple, fontSize: 11, fontWeight: FontWeight.w600)),
+        ),
+      );
+}
+
+class _StepButton extends StatelessWidget {
+  final IconData icon;
+  final String label;
+  final VoidCallback onTap;
+  final bool trailingIcon;
+  const _StepButton({required this.icon, required this.label, required this.onTap, this.trailingIcon = false});
+
+  @override
+  Widget build(BuildContext context) {
+    final ic = PhosphorIcon(icon, size: 18, color: C.text);
+    return Material(
+      color: C.surface2,
+      borderRadius: BorderRadius.circular(R.md),
+      child: InkWell(
+        borderRadius: BorderRadius.circular(R.md),
+        onTap: () { HapticFeedback.selectionClick(); onTap(); },
+        child: Container(
+          height: 52,
+          decoration: BoxDecoration(borderRadius: BorderRadius.circular(R.md), border: Border.all(color: C.border)),
+          child: Row(mainAxisAlignment: MainAxisAlignment.center, children: [
+            if (!trailingIcon) ...[ic, const SizedBox(width: 6)],
+            Text(label, style: T.label),
+            if (trailingIcon) ...[const SizedBox(width: 6), ic],
           ]),
         ),
       ),
     );
   }
-
-  Widget _chip(IconData icon, String label, VoidCallback onTap) => ActionChip(
-        backgroundColor: const Color(0xFF07070F),
-        side: const BorderSide(color: _border),
-        avatar: Icon(icon, color: _purple, size: 18),
-        label: Text(label, style: const TextStyle(color: Colors.white)),
-        onPressed: onTap,
-      );
-
-  Widget _toggleChip(IconData icon, String label, bool on, VoidCallback onTap) => ActionChip(
-        backgroundColor: on ? const Color(0x33818CF8) : const Color(0xFF07070F),
-        side: BorderSide(color: on ? _purple : _border),
-        avatar: Icon(icon, color: on ? _purple : Colors.white70, size: 18),
-        label: Text(label, style: TextStyle(color: on ? _purple : Colors.white)),
-        onPressed: onTap,
-      );
-
-  Widget _bigBtn(String label, Color color, bool active, VoidCallback onTap) => ElevatedButton(
-        style: ElevatedButton.styleFrom(
-          backgroundColor: active ? color.withValues(alpha: 0.45) : color,
-          padding: const EdgeInsets.symmetric(vertical: 16),
-          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
-        ),
-        onPressed: onTap,
-        child: Text(label, style: const TextStyle(color: Colors.white, fontWeight: FontWeight.w700)),
-      );
 }

@@ -1,18 +1,20 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+import 'package:phosphor_flutter/phosphor_flutter.dart';
 import 'package:provider/provider.dart';
 import '../services/connection_service.dart';
 import '../services/discovery_service.dart';
 import '../services/storage.dart';
 import '../utils/pairing.dart';
 import '../utils/permissions.dart';
+import '../ui/tokens.dart';
 import 'qr_scan_screen.dart';
 
-const _purple = Color(0xFF818CF8);
-const _purpleDark = Color(0xFF4F46E5);
-const _bg = Color(0xFF07070F);
-const _card = Color(0xFF111120);
-const _border = Color(0xFF1E1E35);
-
+/// First screen: pick the desktop studio to stream to.
+///
+/// Landscape two-column layout — what this is + the two ways to add a studio on
+/// the left, the studios you can connect to (found on the network, then saved)
+/// on the right, so the thing you tap most is always in reach of a thumb.
 class ConnectScreen extends StatefulWidget {
   const ConnectScreen({super.key});
 
@@ -48,7 +50,7 @@ class _ConnectScreenState extends State<ConnectScreen> {
     final granted = await requestCameraPermission();
     if (!mounted) return;
     if (!granted) {
-      _toast('Camera permission is required to scan QR codes.');
+      _toast('Camera permission is needed to scan the studio QR code.');
       return;
     }
     final result = await Navigator.of(context).push<String>(
@@ -57,62 +59,76 @@ class _ConnectScreenState extends State<ConnectScreen> {
     if (result == null || !mounted) return;
     final pairing = parsePairing(result);
     if (pairing == null) {
-      _toast('QR not recognised. Scan the QR shown in the desktop app.');
+      _toast('That QR code isn\'t from the studio app. Scan the one shown on the desktop.');
       return;
     }
     _showAddDialog(prefillHost: '${pairing.host}:${pairing.controlPort}');
   }
 
-  // ── Manual add / edit ───────────────────────────────────────────────────────
+  // ── Manual add / rename / delete ────────────────────────────────────────────
   void _showAddDialog({String prefillHost = ''}) {
     final nameCtrl = TextEditingController();
     final hostCtrl = TextEditingController(text: prefillHost);
+    String? error;
     showDialog(
       context: context,
-      builder: (ctx) => AlertDialog(
-        backgroundColor: _card,
-        title: const Text('Add Connection', style: TextStyle(color: Colors.white)),
-        content: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            TextField(
-              controller: nameCtrl,
-              style: const TextStyle(color: Colors.white),
-              decoration: _dec('Name (e.g. Main Stage)'),
-            ),
-            const SizedBox(height: 12),
-            TextField(
-              controller: hostCtrl,
-              style: const TextStyle(color: Colors.white),
-              keyboardType: TextInputType.url,
-              autocorrect: false,
-              decoration: _dec('Desktop IP  e.g. 192.168.1.42'),
-            ),
-          ],
+      builder: (ctx) => StatefulBuilder(builder: (ctx, setD) => AlertDialog(
+        title: const Text('Add a studio', style: T.title),
+        // Scrollable: in landscape the keyboard leaves very little height, and
+        // a fixed Column overflowed off the bottom of the dialog.
+        content: SingleChildScrollView(
+          child: SizedBox(
+            width: 360,
+            child: Column(mainAxisSize: MainAxisSize.min, children: [
+              TextField(
+                controller: nameCtrl,
+                style: const TextStyle(color: C.text),
+                textInputAction: TextInputAction.next,
+                decoration: InputDecoration(
+                  labelText: 'Name (optional)',
+                  hintText: 'e.g. Main hall',
+                  prefixIcon: Padding(padding: const EdgeInsets.all(12), child: PhosphorIcon(PhosphorIconsRegular.tag, size: 18, color: C.textDim)),
+                ),
+              ),
+              const SizedBox(height: S.md),
+              TextField(
+                controller: hostCtrl,
+                autofocus: prefillHost.isEmpty,
+                style: const TextStyle(color: C.text),
+                keyboardType: TextInputType.url,
+                autocorrect: false,
+                decoration: InputDecoration(
+                  labelText: 'Desktop IP address',
+                  hintText: '192.168.1.42',
+                  errorText: error,
+                  prefixIcon: Padding(padding: const EdgeInsets.all(12), child: PhosphorIcon(PhosphorIconsRegular.desktop, size: 18, color: C.textDim)),
+                ),
+              ),
+            ]),
+          ),
         ),
         actions: [
           TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Cancel')),
-          ElevatedButton(
-            style: ElevatedButton.styleFrom(backgroundColor: _purpleDark),
+          FilledButton(
             onPressed: () async {
               final pairing = parsePairing(hostCtrl.text);
               if (pairing == null) {
-                _toast('Enter a valid IP, e.g. 192.168.1.42');
+                setD(() => error = 'Enter an IP like 192.168.1.42');
                 return;
               }
               Navigator.pop(ctx);
               await addSavedConnection(
-                name: nameCtrl.text.trim().isEmpty ? 'Desktop' : nameCtrl.text.trim(),
+                name: nameCtrl.text.trim().isEmpty ? 'Studio' : nameCtrl.text.trim(),
                 host: pairing.host,
                 controlPort: pairing.controlPort,
                 videoPort: pairing.videoPort,
               );
               await _refresh();
             },
-            child: const Text('Save'),
+            child: const Text('Save studio'),
           ),
         ],
-      ),
+      )),
     );
   }
 
@@ -121,24 +137,42 @@ class _ConnectScreenState extends State<ConnectScreen> {
     showDialog(
       context: context,
       builder: (ctx) => AlertDialog(
-        backgroundColor: _card,
-        title: const Text('Rename', style: TextStyle(color: Colors.white)),
-        content: TextField(
-          controller: ctrl,
-          autofocus: true,
-          style: const TextStyle(color: Colors.white),
-          decoration: _dec('Connection name'),
+        title: const Text('Rename studio', style: T.title),
+        content: SizedBox(
+          width: 360,
+          child: TextField(controller: ctrl, autofocus: true, style: const TextStyle(color: C.text), decoration: const InputDecoration(labelText: 'Name')),
         ),
         actions: [
           TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Cancel')),
-          ElevatedButton(
-            style: ElevatedButton.styleFrom(backgroundColor: _purpleDark),
+          FilledButton(
             onPressed: () async {
               final n = ctrl.text.trim();
               Navigator.pop(ctx);
               if (n.isNotEmpty) { await renameSavedConnection(conn.id, n); await _refresh(); }
             },
-            child: const Text('Save'),
+            child: const Text('Rename'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  void _confirmDelete(SavedConnection conn) {
+    showDialog(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: Text('Remove "${conn.name}"?', style: T.title),
+        content: const Text('You can add it again any time by scanning its QR code.', style: T.body),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Keep')),
+          FilledButton(
+            style: FilledButton.styleFrom(backgroundColor: C.tally, foregroundColor: Colors.white),
+            onPressed: () async {
+              Navigator.pop(ctx);
+              await removeSavedConnection(conn.id);
+              await _refresh();
+            },
+            child: const Text('Remove'),
           ),
         ],
       ),
@@ -155,20 +189,20 @@ class _ConnectScreenState extends State<ConnectScreen> {
     bool saveFirst = false,
   }) async {
     if (_connectingKey != null) return;
+    HapticFeedback.selectionClick();
     setState(() => _connectingKey = key);
     final conn = context.read<ConnectionService>();
     final settings = await loadSettings();
     conn.configure(deviceName: settings.deviceName);
     // MJPEG ONLY — the stable path: no device-specific H.264 chroma (green) and
     // no Camera2 freeze. Every frame is a full JPEG that decodes cleanly and
-    // renders in preview + menu + presentation. H.264/Camera2 returns later once
-    // its preview/lifecycle are fully built.
+    // renders in preview + menu + presentation.
     conn.setSupportedVideoCodecs(const ['mjpeg']);
     final ok = await conn.connect(host, controlPort, videoPort);
     if (!mounted) return;
     setState(() => _connectingKey = null);
     if (!ok) {
-      _toast('Could not reach "$name" at $host:$controlPort.');
+      _toast('Couldn\'t reach "$name" at $host. Check the desktop app is open and on the same Wi-Fi.');
       return;
     }
     if (saveFirst) {
@@ -178,304 +212,243 @@ class _ConnectScreenState extends State<ConnectScreen> {
     if (mounted) Navigator.of(context).pushNamed('/home');
   }
 
-  void _confirmDelete(SavedConnection conn) {
-    showDialog(
-      context: context,
-      builder: (ctx) => AlertDialog(
-        backgroundColor: _card,
-        title: const Text('Remove Connection', style: TextStyle(color: Colors.white)),
-        content: Text('Remove "${conn.name}"?', style: const TextStyle(color: Colors.white70)),
-        actions: [
-          TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Cancel')),
-          TextButton(
-            onPressed: () async {
-              Navigator.pop(ctx);
-              await removeSavedConnection(conn.id);
-              await _refresh();
-            },
-            child: const Text('Remove', style: TextStyle(color: Color(0xFFEF4444))),
-          ),
-        ],
-      ),
-    );
-  }
+  void _toast(String msg) => ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(msg)));
 
-  void _toast(String msg) {
-    ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(msg)));
-  }
-
-  InputDecoration _dec(String hint) => InputDecoration(
-        hintText: hint,
-        hintStyle: const TextStyle(color: Color(0xFF3A3A55)),
-        filled: true,
-        fillColor: _bg,
-        enabledBorder: OutlineInputBorder(
-          borderRadius: BorderRadius.circular(12),
-          borderSide: const BorderSide(color: _border),
-        ),
-        focusedBorder: OutlineInputBorder(
-          borderRadius: BorderRadius.circular(12),
-          borderSide: const BorderSide(color: _purple),
-        ),
-      );
-
+  // ── UI ──────────────────────────────────────────────────────────────────────
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      backgroundColor: _bg,
+      backgroundColor: C.bg,
       body: SafeArea(
-        child: SingleChildScrollView(
-          padding: const EdgeInsets.all(24),
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.stretch,
-            children: [
-              const SizedBox(height: 20),
-              // Header
-              Center(
-                child: Column(
-                  children: [
+        child: Padding(
+          padding: const EdgeInsets.fromLTRB(S.xl, S.lg, S.xl, S.lg),
+          child: Row(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+            // Left: identity + add actions
+            SizedBox(
+              width: 300,
+              child: SingleChildScrollView(
+                child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                  Row(children: [
                     Container(
-                      width: 80, height: 80,
-                      decoration: BoxDecoration(
-                        color: const Color(0x1F818CF8),
-                        borderRadius: BorderRadius.circular(24),
-                        border: Border.all(color: const Color(0x4D818CF8), width: 2),
-                      ),
-                      child: const Center(child: Text('⛪', style: TextStyle(fontSize: 38))),
+                      width: 48, height: 48,
+                      decoration: BoxDecoration(color: C.accent, borderRadius: BorderRadius.circular(R.md)),
+                      child: PhosphorIcon(PhosphorIconsFill.aperture, size: 28, color: C.accentInk),
                     ),
-                    const SizedBox(height: 10),
-                    const Text('Church Live',
-                        style: TextStyle(color: Colors.white, fontSize: 28, fontWeight: FontWeight.w900)),
-                    const Text('STUDIO CAMERA',
-                        style: TextStyle(color: _purple, fontSize: 12, fontWeight: FontWeight.w600, letterSpacing: 2)),
-                  ],
-                ),
-              ),
-              const SizedBox(height: 24),
-
-              // QR + Manual buttons
-              Row(
-                children: [
-                  Expanded(
-                    child: _bigButton(
-                      icon: Icons.qr_code_scanner,
-                      label: 'Scan QR',
-                      filled: true,
-                      onTap: _scanQr,
+                    const SizedBox(width: S.md),
+                    const Expanded(
+                      child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                        Text('Church Cam', style: TextStyle(color: C.text, fontSize: 22, fontWeight: FontWeight.w800, letterSpacing: -0.4)),
+                        Text('Studio camera for the live stream', style: T.caption),
+                      ]),
                     ),
+                  ]),
+                  const SizedBox(height: S.xl),
+                  const Text('Connect this phone to the desktop studio. Both must be on the same Wi-Fi.', style: T.body),
+                  const SizedBox(height: S.lg),
+                  _primaryAction(
+                    icon: PhosphorIconsBold.qrCode,
+                    title: 'Scan studio QR',
+                    subtitle: 'Fastest — shown in the desktop app',
+                    onTap: _scanQr,
                   ),
-                  const SizedBox(width: 12),
-                  Expanded(
-                    child: _bigButton(
-                      icon: Icons.add,
-                      label: 'Add Manually',
-                      filled: false,
-                      onTap: () => _showAddDialog(),
-                    ),
+                  const SizedBox(height: S.sm),
+                  _secondaryAction(
+                    icon: PhosphorIconsBold.keyboard,
+                    title: 'Enter IP address',
+                    onTap: () => _showAddDialog(),
                   ),
-                ],
+                ]),
               ),
-              const SizedBox(height: 16),
-
-              // Discovered servers (auto-found on the LAN via UDP beacons)
-              AnimatedBuilder(
+            ),
+            const SizedBox(width: S.xl),
+            // Right: studios
+            Expanded(
+              child: AnimatedBuilder(
                 animation: _discovery,
                 builder: (_, __) {
                   final found = _discovery.servers;
-                  if (found.isEmpty) return const SizedBox.shrink();
-                  return _listCard(
-                    'Found on this network',
-                    found.map((s) {
-                      final key = 'disc:${s.host}:${s.controlPort}';
-                      return _row(
-                        icon: '🟢',
-                        iconBg: const Color(0x2622C55E),
-                        name: s.name,
-                        sub: '${s.host}:${s.controlPort}',
-                        connecting: _connectingKey == key,
-                        trailing: const Text('Tap to connect',
-                            style: TextStyle(color: _purple, fontSize: 12, fontWeight: FontWeight.w700)),
-                        onTap: () => _connect(
-                          key: key, name: s.name, host: s.host,
-                          controlPort: s.controlPort, videoPort: s.videoPort, saveFirst: true,
-                        ),
-                      );
-                    }).toList(),
+                  final hasAny = found.isNotEmpty || _saved.isNotEmpty;
+                  return Container(
+                    decoration: BoxDecoration(color: const Color(0xFF111117), borderRadius: BorderRadius.circular(R.lg), border: Border.all(color: C.border)),
+                    child: !hasAny
+                        ? _emptyState()
+                        : ListView(padding: const EdgeInsets.all(S.lg), children: [
+                            if (found.isNotEmpty) ...[
+                              _listHeader('On this network', PhosphorIconsBold.wifiHigh, live: true),
+                              ...found.map((s) {
+                                final key = 'disc:${s.host}:${s.controlPort}';
+                                return _studioRow(
+                                  icon: PhosphorIconsFill.desktop,
+                                  iconColor: C.ok,
+                                  name: s.name,
+                                  sub: s.host,
+                                  connecting: _connectingKey == key,
+                                  onTap: () => _connect(key: key, name: s.name, host: s.host,
+                                      controlPort: s.controlPort, videoPort: s.videoPort, saveFirst: true),
+                                );
+                              }),
+                              const SizedBox(height: S.lg),
+                            ],
+                            if (_saved.isNotEmpty) ...[
+                              _listHeader('Saved studios', PhosphorIconsBold.bookmarkSimple),
+                              ..._saved.map((c) => _studioRow(
+                                    icon: PhosphorIconsFill.desktopTower,
+                                    iconColor: C.accent,
+                                    name: c.name,
+                                    sub: c.host,
+                                    connecting: _connectingKey == c.id,
+                                    onTap: () => _connect(key: c.id, name: c.name, host: c.host,
+                                        controlPort: c.controlPort, videoPort: c.videoPort),
+                                    menu: PopupMenuButton<String>(
+                                      tooltip: 'More',
+                                      color: C.surface2,
+                                      icon: PhosphorIcon(PhosphorIconsBold.dotsThreeVertical, size: 20, color: C.textDim),
+                                      onSelected: (v) => v == 'rename' ? _showRenameDialog(c) : _confirmDelete(c),
+                                      itemBuilder: (_) => [
+                                        PopupMenuItem(value: 'rename', child: Row(children: [
+                                          PhosphorIcon(PhosphorIconsRegular.pencilSimple, size: 18, color: C.text),
+                                          const SizedBox(width: S.sm), const Text('Rename'),
+                                        ])),
+                                        PopupMenuItem(value: 'remove', child: Row(children: [
+                                          PhosphorIcon(PhosphorIconsRegular.trash, size: 18, color: C.tally),
+                                          const SizedBox(width: S.sm), const Text('Remove', style: TextStyle(color: C.tally)),
+                                        ])),
+                                      ],
+                                    ),
+                                  )),
+                            ],
+                          ]),
                   );
                 },
               ),
-
-              const SizedBox(height: 16),
-
-              // Saved connections
-              if (_saved.isEmpty)
-                Container(
-                  padding: const EdgeInsets.all(32),
-                  decoration: BoxDecoration(
-                    color: _card,
-                    borderRadius: BorderRadius.circular(20),
-                    border: Border.all(color: _border),
-                  ),
-                  child: const Column(
-                    children: [
-                      Text('📡', style: TextStyle(fontSize: 36)),
-                      SizedBox(height: 10),
-                      Text('No Cameras Added',
-                          style: TextStyle(color: Colors.white, fontSize: 17, fontWeight: FontWeight.w800)),
-                      SizedBox(height: 8),
-                      Text('Scan the QR code shown in the desktop app, or tap "Add Manually".',
-                          textAlign: TextAlign.center,
-                          style: TextStyle(color: Color(0xFF666666), fontSize: 13)),
-                    ],
-                  ),
-                )
-              else
-                _listCard(
-                  'Saved Cameras',
-                  _saved.map((conn) {
-                    return _row(
-                      icon: '📺',
-                      iconBg: const Color(0x1F818CF8),
-                      name: conn.name,
-                      sub: conn.url,
-                      connecting: _connectingKey == conn.id,
-                      trailing: Row(
-                        mainAxisSize: MainAxisSize.min,
-                        children: [
-                          IconButton(
-                            icon: const Icon(Icons.edit, color: Color(0xFF888888), size: 18),
-                            onPressed: () => _showRenameDialog(conn),
-                          ),
-                          IconButton(
-                            icon: const Icon(Icons.close, color: Color(0xFFEF4444), size: 18),
-                            onPressed: () => _confirmDelete(conn),
-                          ),
-                        ],
-                      ),
-                      onTap: () => _connect(
-                        key: conn.id, name: conn.name, host: conn.host,
-                        controlPort: conn.controlPort, videoPort: conn.videoPort,
-                      ),
-                    );
-                  }).toList(),
-                ),
-
-              const SizedBox(height: 24),
-              const Center(
-                child: Text('Church Cam · LAN Studio Camera',
-                    style: TextStyle(color: Color(0xFF1E1E35), fontSize: 11)),
-              ),
-            ],
-          ),
+            ),
+          ]),
         ),
       ),
     );
   }
 
-  Widget _bigButton({
+  Widget _emptyState() => Center(
+        child: Padding(
+          padding: const EdgeInsets.all(S.xl),
+          child: Column(mainAxisSize: MainAxisSize.min, children: [
+            Container(
+              width: 56, height: 56,
+              decoration: BoxDecoration(color: C.surface2, borderRadius: BorderRadius.circular(R.lg)),
+              child: PhosphorIcon(PhosphorIconsRegular.magnifyingGlass, size: 26, color: C.textDim),
+            ),
+            const SizedBox(height: S.md),
+            const Text('Looking for studios…', style: T.title),
+            const SizedBox(height: S.xs),
+            const Text('Open the desktop app on the same Wi-Fi and it appears here automatically. Or scan its QR code.',
+                textAlign: TextAlign.center, style: T.body),
+            const SizedBox(height: S.lg),
+            const SizedBox(width: 20, height: 20, child: CircularProgressIndicator(strokeWidth: 2, color: C.accent)),
+          ]),
+        ),
+      );
+
+  Widget _listHeader(String label, IconData icon, {bool live = false}) => Padding(
+        padding: const EdgeInsets.only(bottom: S.sm, left: S.xs),
+        child: Row(children: [
+          PhosphorIcon(icon, size: 14, color: live ? C.ok : C.textFaint),
+          const SizedBox(width: 6),
+          Text(label.toUpperCase(), style: T.overline.copyWith(color: live ? C.ok : C.textFaint)),
+        ]),
+      );
+
+  Widget _studioRow({
     required IconData icon,
-    required String label,
-    required bool filled,
-    required VoidCallback onTap,
-  }) {
-    return GestureDetector(
-      onTap: onTap,
-      child: Container(
-        padding: const EdgeInsets.symmetric(vertical: 16),
-        decoration: BoxDecoration(
-          color: filled ? _purpleDark : _card,
-          borderRadius: BorderRadius.circular(16),
-          border: filled ? null : Border.all(color: _border, width: 1.5),
-        ),
-        child: Row(
-          mainAxisAlignment: MainAxisAlignment.center,
-          children: [
-            Icon(icon, color: filled ? Colors.white : _purple, size: 20),
-            const SizedBox(width: 8),
-            Text(label,
-                style: TextStyle(
-                    color: filled ? Colors.white : const Color(0xFFCCCCCC),
-                    fontSize: 15, fontWeight: FontWeight.w800)),
-          ],
-        ),
-      ),
-    );
-  }
-
-  Widget _listCard(String label, List<Widget> rows) {
-    final children = <Widget>[];
-    for (var i = 0; i < rows.length; i++) {
-      if (i > 0) {
-        children.add(const Divider(height: 1, color: _border, indent: 18, endIndent: 18));
-      }
-      children.add(rows[i]);
-    }
-    return Container(
-      decoration: BoxDecoration(
-        color: _card,
-        borderRadius: BorderRadius.circular(20),
-        border: Border.all(color: _border),
-      ),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Padding(
-            padding: const EdgeInsets.fromLTRB(18, 14, 18, 8),
-            child: Text(label.toUpperCase(),
-                style: const TextStyle(
-                    color: _purple, fontSize: 10, fontWeight: FontWeight.w700, letterSpacing: 1.5)),
-          ),
-          ...children,
-        ],
-      ),
-    );
-  }
-
-  Widget _row({
-    required String icon,
-    required Color iconBg,
+    required Color iconColor,
     required String name,
     required String sub,
     required bool connecting,
-    required Widget trailing,
     required VoidCallback onTap,
-  }) {
-    return InkWell(
-      onTap: connecting ? null : onTap,
-      child: Padding(
-        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
-        child: Row(
-          children: [
-            Container(
-              width: 44, height: 44,
-              decoration: BoxDecoration(
-                color: iconBg,
-                borderRadius: BorderRadius.circular(14),
-              ),
-              child: Center(child: Text(icon, style: const TextStyle(fontSize: 20))),
-            ),
-            const SizedBox(width: 12),
-            Expanded(
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Text(name, maxLines: 1, overflow: TextOverflow.ellipsis,
-                      style: const TextStyle(color: Colors.white, fontSize: 15, fontWeight: FontWeight.w700)),
-                  Text(sub, maxLines: 1, overflow: TextOverflow.ellipsis,
-                      style: const TextStyle(color: Color(0xFF555555), fontSize: 12)),
+    Widget? menu,
+  }) =>
+      Padding(
+        padding: const EdgeInsets.only(bottom: S.sm),
+        child: Material(
+          color: C.surface2,
+          borderRadius: BorderRadius.circular(R.md),
+          child: InkWell(
+            borderRadius: BorderRadius.circular(R.md),
+            onTap: connecting ? null : onTap,
+            child: Container(
+              height: 64,
+              padding: const EdgeInsets.only(left: S.md, right: S.xs),
+              decoration: BoxDecoration(borderRadius: BorderRadius.circular(R.md), border: Border.all(color: C.border)),
+              child: Row(children: [
+                Container(
+                  width: 40, height: 40,
+                  decoration: BoxDecoration(color: iconColor.withValues(alpha: 0.15), borderRadius: BorderRadius.circular(R.sm)),
+                  child: PhosphorIcon(icon, size: 20, color: iconColor),
+                ),
+                const SizedBox(width: S.md),
+                Expanded(child: Column(mainAxisAlignment: MainAxisAlignment.center, crossAxisAlignment: CrossAxisAlignment.start, children: [
+                  Text(name, maxLines: 1, overflow: TextOverflow.ellipsis, style: T.label),
+                  Text(sub, maxLines: 1, overflow: TextOverflow.ellipsis, style: T.caption.copyWith(fontFeatures: const [FontFeature.tabularFigures()])),
+                ])),
+                if (connecting)
+                  const Padding(
+                    padding: EdgeInsets.symmetric(horizontal: S.md),
+                    child: SizedBox(width: 20, height: 20, child: CircularProgressIndicator(strokeWidth: 2, color: C.accent)),
+                  )
+                else ...[
+                  Container(
+                    padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                    decoration: BoxDecoration(color: C.accentSoft, borderRadius: BorderRadius.circular(R.pill)),
+                    child: Row(mainAxisSize: MainAxisSize.min, children: [
+                      const Text('Connect', style: TextStyle(color: C.accent, fontSize: 13, fontWeight: FontWeight.w700)),
+                      const SizedBox(width: 4),
+                      PhosphorIcon(PhosphorIconsBold.arrowRight, size: 14, color: C.accent),
+                    ]),
+                  ),
+                  if (menu != null) menu else const SizedBox(width: S.sm),
                 ],
-              ),
+              ]),
             ),
-            if (connecting)
-              const Padding(
-                padding: EdgeInsets.only(right: 6),
-                child: SizedBox(width: 18, height: 18, child: CircularProgressIndicator(strokeWidth: 2, color: _purple)),
-              )
-            else
-              trailing,
-          ],
+          ),
         ),
-      ),
-    );
-  }
+      );
+
+  Widget _primaryAction({required IconData icon, required String title, required String subtitle, required VoidCallback onTap}) => Material(
+        color: C.accent,
+        borderRadius: BorderRadius.circular(R.md),
+        child: InkWell(
+          borderRadius: BorderRadius.circular(R.md),
+          onTap: () { HapticFeedback.selectionClick(); onTap(); },
+          child: Container(
+            height: 68,
+            padding: const EdgeInsets.symmetric(horizontal: S.lg),
+            child: Row(children: [
+              PhosphorIcon(icon, size: 26, color: C.accentInk),
+              const SizedBox(width: S.md),
+              Expanded(child: Column(mainAxisAlignment: MainAxisAlignment.center, crossAxisAlignment: CrossAxisAlignment.start, children: [
+                Text(title, style: const TextStyle(color: C.accentInk, fontSize: 15, fontWeight: FontWeight.w800)),
+                Text(subtitle, style: const TextStyle(color: Color(0xB30B0B14), fontSize: 12, fontWeight: FontWeight.w600)),
+              ])),
+            ]),
+          ),
+        ),
+      );
+
+  Widget _secondaryAction({required IconData icon, required String title, required VoidCallback onTap}) => Material(
+        color: C.surface2,
+        borderRadius: BorderRadius.circular(R.md),
+        child: InkWell(
+          borderRadius: BorderRadius.circular(R.md),
+          onTap: () { HapticFeedback.selectionClick(); onTap(); },
+          child: Container(
+            height: 52,
+            padding: const EdgeInsets.symmetric(horizontal: S.lg),
+            decoration: BoxDecoration(borderRadius: BorderRadius.circular(R.md), border: Border.all(color: C.border)),
+            child: Row(children: [
+              PhosphorIcon(icon, size: 20, color: C.text),
+              const SizedBox(width: S.md),
+              Text(title, style: T.label),
+            ]),
+          ),
+        ),
+      );
 }

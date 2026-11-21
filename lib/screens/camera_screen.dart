@@ -1,7 +1,9 @@
 import 'dart:async';
 import 'dart:math' as math;
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:camera/camera.dart';
+import 'package:phosphor_flutter/phosphor_flutter.dart';
 import 'package:provider/provider.dart';
 import 'package:wakelock_plus/wakelock_plus.dart';
 import '../services/connection_service.dart';
@@ -13,12 +15,12 @@ import '../services/storage.dart';
 import '../services/smart_framer.dart';
 import '../models/camera_filters.dart';
 import '../utils/permissions.dart';
-import '../widgets/reading_overlay.dart';
-import '../widgets/connection_badge.dart';
 import '../widgets/metrics_overlay.dart';
 import '../widgets/filtered_preview.dart';
-
-const _purple = Color(0xFF818CF8);
+import '../ui/tokens.dart';
+import '../ui/components.dart';
+import 'control_screen.dart';
+import 'settings_screen.dart';
 
 class CameraScreen extends StatefulWidget {
   const CameraScreen({super.key});
@@ -38,7 +40,9 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
   String? _initError;
 
   CameraFilters _filters = CameraFilters.none;
-  bool _showFilters = false;
+
+  // Which side-panel tab is open (null = clean viewfinder).
+  _Tab? _tab;
 
   // Pinch-to-zoom
   double _baseZoom = 1.0;
@@ -47,8 +51,6 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
 
   // Smart Zoom: while this mode is on, tapping a person locks the shot on them.
   bool _smartMode = false;
-  // Live switcher (pick which desktop camera is on air).
-  bool _showSwitcher = false;
 
   // Phone → desktop state report (zoom + Smart Zoom), throttled.
   Timer? _stateReportTimer;
@@ -479,39 +481,53 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
     super.dispose();
   }
 
+  // ══════════════════════════════════════════════════════════════════════════
+  //  UI
+  //  Landscape broadcast-camera layout:
+  //    • full-bleed viewfinder (pinch anywhere to zoom, tap to focus / pick)
+  //    • left icon rail = tabs (Live · Smart · Image · Studio · Settings);
+  //      a tab slides a panel in beside it, the picture stays live
+  //    • top HUD: link, Wi-Fi, battery · tally · format
+  //    • right tool rail: lens, torch, AF lock, AE lock, Smart
+  //    • bottom zoom dial: presets + drag-to-scrub
+  // ══════════════════════════════════════════════════════════════════════════
+  static const double _railW = 72;
+
+  double _panelW(Size size) => math.min(380.0, math.max(300.0, size.width * 0.38));
+
+  void _openTab(_Tab t) {
+    setState(() => _tab = _tab == t ? null : t);
+  }
+
   @override
   Widget build(BuildContext context) {
     if (_permissionDenied) return _permissionDeniedView();
     if (_initError != null) return _errorView(_initError!);
-    if (_initializing || !_camera.isInitialized) {
-      return const Center(
-        child: Column(mainAxisSize: MainAxisSize.min, children: [
-          CircularProgressIndicator(color: Colors.white),
-          SizedBox(height: 16),
-          Text('Starting camera…', style: TextStyle(color: Colors.white70)),
-        ]),
-      );
-    }
+    if (_initializing || !_camera.isInitialized) return _startingView();
 
     return LayoutBuilder(builder: (context, constraints) {
       final size = Size(constraints.maxWidth, constraints.maxHeight);
+      final panelW = _panelW(size);
+      final panelOpen = _tab != null;
+      final contentLeft = _railW + (panelOpen ? panelW : 0);
+
       return Stack(
         fit: StackFit.expand,
         children: [
+          // ── Viewfinder ─────────────────────────────────────────────────────
           GestureDetector(
-            // Opaque: the preview must win every touch on it, including the
-            // second finger of a pinch landing on an empty area.
             behavior: HitTestBehavior.opaque,
             onScaleStart: (_) => _baseZoom = _camera.zoom,
             onScaleUpdate: (d) {
               if (d.pointerCount >= 2 && (d.scale - 1.0).abs() > 0.01) _applyZoom(_baseZoom * d.scale);
             },
-            onTapDown: (d) => _smartMode ? _smartTap(d, size) : _tapFocus(d, size),
+            onTapDown: (d) {
+              if (panelOpen) { setState(() => _tab = null); return; }
+              _smartMode ? _smartTap(d, size) : _tapFocus(d, size);
+            },
             child: FilteredPreview(filters: _filters, child: _buildPreview()),
           ),
 
-          // Smart Zoom framing: dims what the audience does NOT see and marks
-          // the followed person. Repaints from the camera's framing ticks only.
           IgnorePointer(
             child: CustomPaint(
               size: size,
@@ -523,87 +539,119 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
             ),
           ),
 
-          // ON AIR tally — red rim when the desktop has THIS phone live.
+          if (_focusPoint != null)
+            Positioned(
+              left: _focusPoint!.dx * size.width - 36,
+              top: _focusPoint!.dy * size.height - 36,
+              child: const IgnorePointer(child: _FocusRing()),
+            ),
+
+          // ON AIR rim
           Consumer<ConnectionService>(
-            builder: (_, conn, __) => conn.isSelfLive
-                ? IgnorePointer(
-                    child: Container(
-                      decoration: BoxDecoration(border: Border.all(color: const Color(0xFFEF4444), width: 4)),
-                      alignment: Alignment.topCenter,
-                      padding: const EdgeInsets.only(top: 10),
-                      child: Container(
-                        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
-                        decoration: BoxDecoration(color: const Color(0xFFEF4444), borderRadius: BorderRadius.circular(6)),
-                        child: const Text('ON AIR', style: TextStyle(color: Colors.white, fontWeight: FontWeight.w900, letterSpacing: 1.5, fontSize: 12)),
-                      ),
-                    ),
-                  )
-                : const SizedBox.shrink(),
+            builder: (_, conn, __) => IgnorePointer(
+              child: AnimatedContainer(
+                duration: const Duration(milliseconds: 200),
+                decoration: BoxDecoration(
+                  border: Border.all(color: conn.isSelfLive ? C.tally : Colors.transparent, width: 3),
+                ),
+              ),
+            ),
+          ),
+
+          // Top scrim so the HUD reads on bright scenes.
+          const Positioned(
+            left: 0, right: 0, top: 0, height: 88,
+            child: IgnorePointer(
+              child: DecoratedBox(
+                decoration: BoxDecoration(
+                  gradient: LinearGradient(
+                    begin: Alignment.topCenter, end: Alignment.bottomCenter,
+                    colors: [Color(0x8C000000), Color(0x00000000)],
+                  ),
+                ),
+              ),
+            ),
+          ),
+
+          // ── Top HUD ────────────────────────────────────────────────────────
+          AnimatedPositioned(
+            duration: const Duration(milliseconds: 220), curve: Curves.easeOutCubic,
+            left: contentLeft + S.md, right: S.md, top: S.md,
+            child: _buildHud(),
+          ),
+
+          if (_showMetrics)
+            AnimatedPositioned(
+              duration: const Duration(milliseconds: 220), curve: Curves.easeOutCubic,
+              left: contentLeft + S.md, top: 56,
+              child: MetricsOverlay(camera: _camera, status: _deviceStatus),
+            ),
+
+          // Reading text pushed from the desktop, under the tally.
+          Consumer<ConnectionService>(
+            builder: (_, conn, __) => conn.readingText.trim().isEmpty
+                ? const SizedBox.shrink()
+                : Positioned(
+                    top: 56, left: contentLeft + 80, right: 96,
+                    child: IgnorePointer(child: Center(child: Container(
+                      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+                      decoration: BoxDecoration(color: const Color(0xB3000000), borderRadius: BorderRadius.circular(R.md)),
+                      child: Text(conn.readingText, textAlign: TextAlign.center, maxLines: 3, overflow: TextOverflow.ellipsis,
+                          style: const TextStyle(color: C.text, fontSize: 17, fontWeight: FontWeight.w700, height: 1.3)),
+                    ))),
+                  ),
           ),
 
           if (_smartMode && !_camera.smartZoomActive)
             Positioned(
-              top: 96, left: 0, right: 0,
+              left: contentLeft + S.md, right: 84, bottom: 84,
               child: IgnorePointer(child: Center(child: Container(
-                padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
-                decoration: BoxDecoration(color: const Color(0xCC000000), borderRadius: BorderRadius.circular(20), border: Border.all(color: _purple)),
-                child: const Text('اضغط على الشخص اللي عايز تتابعه  •  Tap a person to follow',
-                    style: TextStyle(color: Colors.white, fontSize: 13, fontWeight: FontWeight.w600)),
+                padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+                decoration: BoxDecoration(color: const Color(0xD9000000), borderRadius: BorderRadius.circular(R.pill), border: Border.all(color: C.accent)),
+                child: Row(mainAxisSize: MainAxisSize.min, children: [
+                  PhosphorIcon(PhosphorIconsFill.handTap, color: C.accent, size: 18),
+                  const SizedBox(width: 8),
+                  const Flexible(child: Text('اضغط على الشخص لمتابعته  ·  Tap a person to follow',
+                      style: T.label, maxLines: 1, overflow: TextOverflow.ellipsis)),
+                ]),
               ))),
             ),
 
-          if (_focusPoint != null)
+          // ── Right tool rail ────────────────────────────────────────────────
+          // Scrolls rather than overflowing on short (landscape) screens.
+          Positioned(right: S.md, top: 56, bottom: S.md, child: Center(child: SingleChildScrollView(child: _buildToolRail()))),
+
+          // ── Bottom zoom dial ───────────────────────────────────────────────
+          AnimatedPositioned(
+            duration: const Duration(milliseconds: 220), curve: Curves.easeOutCubic,
+            left: contentLeft, right: 76, bottom: S.md,
+            child: Center(child: _buildZoomDial()),
+          ),
+
+          // Big transient zoom readout while pinching / scrubbing.
+          if (_showZoomBar)
             Positioned(
-              left: _focusPoint!.dx * size.width - 30,
-              top: _focusPoint!.dy * size.height - 30,
-              child: _FocusRing(),
+              left: contentLeft, right: 0, top: 0, bottom: 0,
+              child: IgnorePointer(child: Center(child: Container(
+                padding: const EdgeInsets.symmetric(horizontal: 18, vertical: 10),
+                decoration: BoxDecoration(color: const Color(0xB3000000), borderRadius: BorderRadius.circular(R.lg)),
+                child: Column(mainAxisSize: MainAxisSize.min, children: [
+                  Text('${_camera.zoom.toStringAsFixed(1)}×', style: T.zoom.copyWith(fontSize: 34)),
+                  if (!_camera.hasHardwareZoom) const Text('DIGITAL', style: T.overline),
+                ]),
+              ))),
             ),
 
-          // Connection badge (top-left) — tap to toggle the full metrics HUD.
-          Positioned(
-            top: 44, left: 16,
-            child: GestureDetector(
-              onTap: () => setState(() => _showMetrics = !_showMetrics),
-              child: const ConnectionBadge(),
-            ),
+          // ── Side panel (tab content) ───────────────────────────────────────
+          AnimatedPositioned(
+            duration: const Duration(milliseconds: 240), curve: Curves.easeOutCubic,
+            left: panelOpen ? _railW : _railW - panelW - 8,
+            top: 0, bottom: 0, width: panelW,
+            child: _buildPanel(),
           ),
 
-          // Metrics HUD (top-left, under the badge)
-          if (_showMetrics)
-            Positioned(top: 84, left: 16, child: MetricsOverlay(camera: _camera, status: _deviceStatus)),
-
-          // Torch + flip quick toggles (top-right)
-          Positioned(top: 40, right: 12, child: Row(children: [
-            // AF-L: hold focus
-            _labelToggle('AF-L', _camera.focusLocked,
-                () => _camera.setFocusLocked(!_camera.focusLocked)),
-            const SizedBox(width: 8),
-            // AE-L: hold exposure
-            _labelToggle('AE-L', _camera.exposureLocked,
-                () => _camera.setExposureLocked(!_camera.exposureLocked)),
-            const SizedBox(width: 8),
-            _labelToggle('🎯 SMART', _smartMode, _toggleSmartMode),
-            const SizedBox(width: 8),
-            _circle(_camera.torchOn ? Icons.flash_on : Icons.flash_off,
-                _camera.hasTorch ? () => _camera.toggleTorch() : null),
-            const SizedBox(width: 8),
-            _circle(Icons.cameraswitch, () async {
-              await _camera.switchCamera();
-              if (mounted) setState(() => _smartMode = false);
-              _conn?.sendCapabilities(_camera.capabilities());
-              _reportPhoneState();
-            }),
-          ])),
-
-          if (_showZoomBar) _buildZoomBar(),
-
-          // Bottom collapsible panel
-          _buildBottomPanel(),
-
-          // Reading text bar (very bottom)
-          Consumer<ConnectionService>(
-            builder: (_, conn, __) => ReadingOverlay(text: conn.readingText),
-          ),
+          // ── Left tab rail ──────────────────────────────────────────────────
+          Positioned(left: 0, top: 0, bottom: 0, width: _railW, child: _buildRail()),
         ],
       );
     });
@@ -630,274 +678,564 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
     );
   }
 
-  Widget _buildZoomBar() {
-    final pct = _camera.maxZoom > _camera.minZoom
-        ? (_camera.zoom - _camera.minZoom) / (_camera.maxZoom - _camera.minZoom) : 0.0;
-    return Positioned(
-      bottom: 200, left: 0, right: 0,
-      child: Center(child: Container(
-        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
-        decoration: BoxDecoration(color: const Color(0xCC000000), borderRadius: BorderRadius.circular(20), border: Border.all(color: const Color(0x66818CF8))),
-        child: Row(mainAxisSize: MainAxisSize.min, children: [
-          SizedBox(width: 100, child: ClipRRect(borderRadius: BorderRadius.circular(2),
-            child: LinearProgressIndicator(value: pct.clamp(0.0, 1.0), backgroundColor: Colors.white24, valueColor: const AlwaysStoppedAnimation(_purple), minHeight: 4))),
-          const SizedBox(width: 10),
-          Text('${_camera.zoom.toStringAsFixed(1)}×', style: const TextStyle(color: _purple, fontWeight: FontWeight.bold)),
-          if (!_camera.hasHardwareZoom) ...[
-            const SizedBox(width: 6),
-            const Text('digital', style: TextStyle(color: Colors.white54, fontSize: 11)),
-          ],
-        ]),
-      )),
-    );
-  }
-
-  Widget _buildBottomPanel() {
-    final zMin = _camera.minZoom;
-    final zMax = _camera.maxZoom > zMin ? _camera.maxZoom : zMin + 1;
-    final step = (zMax - zMin) / 10;
-    // Quick-zoom presets that exist on this lens.
-    final presets = <double>[1, 2, 3, 5].where((z) => z >= zMin - 0.01 && z <= zMax + 0.01).toList();
-    return Positioned(
-      bottom: 0, left: 0, right: 0,
-      child: Container(
-        color: const Color(0x99000000),
-        padding: const EdgeInsets.fromLTRB(12, 6, 12, 26),
-        child: Column(mainAxisSize: MainAxisSize.min, children: [
-          // Header row: zoom −/slider/+ , presets, panels
-          Row(children: [
-            _miniBtn(Icons.zoom_out, () => _applyZoom(_camera.zoom - step)),
-            Expanded(child: Slider(
-              value: _camera.zoom.clamp(zMin, zMax),
-              min: zMin, max: zMax,
-              activeColor: _purple,
-              onChanged: (v) => _applyZoom(v),
-            )),
-            _miniBtn(Icons.zoom_in, () => _applyZoom(_camera.zoom + step)),
-            const SizedBox(width: 6),
-            ...presets.map((z) => Padding(
-                  padding: const EdgeInsets.only(right: 4),
-                  child: _pill('${z.toStringAsFixed(0)}×', (_camera.zoom - z).abs() < 0.05, () => _animateZoom(z)),
-                )),
-            IconButton(
-              tooltip: 'Live switcher',
-              icon: Icon(Icons.switch_video, color: _showSwitcher ? _purple : Colors.white70),
-              onPressed: () => setState(() { _showSwitcher = !_showSwitcher; if (_showSwitcher) _showFilters = false; }),
+  // ── Left rail (tabs) ────────────────────────────────────────────────────────
+  Widget _buildRail() {
+    Widget tab(_Tab t, IconData icon, IconData activeIcon, String label) {
+      final on = _tab == t;
+      return Semantics(
+        button: true, selected: on, label: label,
+        child: Tooltip(
+          message: label,
+          preferBelow: false,
+          child: GestureDetector(
+            onTap: () { HapticFeedback.selectionClick(); _openTab(t); },
+            child: AnimatedContainer(
+              duration: const Duration(milliseconds: 160),
+              width: 52, height: 52,
+              margin: const EdgeInsets.symmetric(vertical: 4),
+              decoration: BoxDecoration(
+                color: on ? C.accent : Colors.transparent,
+                borderRadius: BorderRadius.circular(R.md),
+              ),
+              child: PhosphorIcon(on ? activeIcon : icon, size: 24, color: on ? C.accentInk : C.textDim),
             ),
-            IconButton(
-              tooltip: 'Filters',
-              icon: Icon(Icons.auto_awesome, color: _showFilters ? _purple : Colors.white70),
-              onPressed: () => setState(() { _showFilters = !_showFilters; if (_showFilters) _showSwitcher = false; }),
-            ),
-          ]),
+          ),
+        ),
+      );
+    }
 
-          if (_smartMode) _buildSmartRow(),
-          if (_showSwitcher) _buildSwitcher(),
-
-          if (_showFilters) ...[
-            SizedBox(height: 44, child: ListView(
-              scrollDirection: Axis.horizontal,
-              children: kFilterPresets.map((p) => Padding(
-                padding: const EdgeInsets.symmetric(horizontal: 4),
-                child: ActionChip(
-                  backgroundColor: const Color(0xFF1E1E32),
-                  label: Text(p.name, style: const TextStyle(color: Colors.white, fontSize: 12)),
-                  onPressed: () => _setFilters(p.filters),
+    return Container(
+      decoration: const BoxDecoration(
+        color: Color(0xF00D0D12),
+        border: Border(right: BorderSide(color: C.hairline)),
+      ),
+      child: SafeArea(
+        right: false,
+        child: Column(children: [
+          const SizedBox(height: S.md),
+          // Viewfinder "home": closes any panel.
+          Semantics(
+            button: true, label: 'Viewfinder',
+            child: GestureDetector(
+              onTap: () => setState(() => _tab = null),
+              child: Container(
+                width: 44, height: 44,
+                decoration: BoxDecoration(
+                  borderRadius: BorderRadius.circular(R.md),
+                  border: Border.all(color: _tab == null ? C.accent : C.border, width: 1.5),
                 ),
-              )).toList(),
-            )),
-            _filterSlider('Brightness', _filters.brightness, 0, 200, (v) => _setFilters(_filters.copyWith(brightness: v))),
-            _filterSlider('Contrast', _filters.contrast, 0, 200, (v) => _setFilters(_filters.copyWith(contrast: v))),
-            _filterSlider('Saturation', _filters.saturation, 0, 200, (v) => _setFilters(_filters.copyWith(saturation: v))),
-            _filterSlider('Blur', _filters.blur, 0, 10, (v) => _setFilters(_filters.copyWith(blur: v))),
-          ],
+                child: PhosphorIcon(PhosphorIconsFill.aperture, color: _tab == null ? C.accent : C.textDim, size: 24),
+              ),
+            ),
+          ),
+          const SizedBox(height: S.md),
+          Container(width: 28, height: 1, color: C.border),
+          Expanded(
+            child: SingleChildScrollView(
+              padding: const EdgeInsets.symmetric(vertical: S.sm),
+              child: Column(children: [
+                tab(_Tab.live, PhosphorIconsRegular.broadcast, PhosphorIconsFill.broadcast, 'Live cameras'),
+                tab(_Tab.smart, PhosphorIconsRegular.userFocus, PhosphorIconsFill.userFocus, 'Smart Zoom'),
+                tab(_Tab.image, PhosphorIconsRegular.faders, PhosphorIconsFill.faders, 'Image & filters'),
+                tab(_Tab.studio, PhosphorIconsRegular.projectorScreen, PhosphorIconsFill.projectorScreen, 'Studio control'),
+              ]),
+            ),
+          ),
+          tab(_Tab.settings, PhosphorIconsRegular.gearSix, PhosphorIconsFill.gearSix, 'Settings'),
+          const SizedBox(height: S.md),
         ]),
       ),
     );
   }
 
-  /// Smart Zoom controls: shot size, follow on/off, release.
-  Widget _buildSmartRow() {
-    final f = _camera.framer;
-    final active = _camera.smartZoomActive;
-    final lost = active && _camera.tracker.lost;
-    final shots = const [
-      ('Wide', ShotSize.wide),
-      ('Medium', ShotSize.medium),
-      ('Close', ShotSize.close),
-    ];
-    return Padding(
-      padding: const EdgeInsets.only(top: 2, bottom: 4),
-      child: Row(children: [
-        Icon(lost ? Icons.person_off : Icons.person_pin_circle,
-            color: lost ? const Color(0xFFF59E0B) : (active ? const Color(0xFF22C55E) : Colors.white54), size: 20),
-        const SizedBox(width: 6),
-        Expanded(
-          child: Text(
-            !active ? 'Smart Zoom: tap a person' : (lost ? 'Lost — tap to re-lock' : (f.follow ? 'Following' : 'Locked')),
-            maxLines: 1,
-            overflow: TextOverflow.ellipsis,
-            style: TextStyle(color: lost ? const Color(0xFFF59E0B) : Colors.white70, fontSize: 12, fontWeight: FontWeight.w600),
+  // ── Top HUD ─────────────────────────────────────────────────────────────────
+  Widget _buildHud() {
+    return Consumer<ConnectionService>(builder: (_, conn, __) {
+      final connected = conn.status == ConnectionStatus.connected;
+      final ms = conn.latencyMs;
+      final linkColor = !connected ? C.tally : (ms < 60 ? C.ok : (ms <= 150 ? C.warn : C.tally));
+      final linkText = connected ? '$ms ms' : (conn.status == ConnectionStatus.reconnecting ? 'Reconnecting' : 'Offline');
+
+      final bars = _deviceStatus.wifiBars;
+      final wifiIcon = _deviceStatus.wifiRssi <= -127 ? PhosphorIconsRegular.wifiSlash
+          : bars >= 3 ? PhosphorIconsBold.wifiHigh
+          : bars == 2 ? PhosphorIconsBold.wifiMedium
+          : bars == 1 ? PhosphorIconsBold.wifiLow : PhosphorIconsBold.wifiNone;
+      final bp = _deviceStatus.batteryPercent;
+      final batIcon = _deviceStatus.charging ? PhosphorIconsBold.batteryCharging
+          : bp < 0 ? PhosphorIconsBold.batteryMedium
+          : bp > 80 ? PhosphorIconsBold.batteryFull
+          : bp > 50 ? PhosphorIconsBold.batteryHigh
+          : bp > 20 ? PhosphorIconsBold.batteryMedium
+          : bp > 10 ? PhosphorIconsBold.batteryLow : PhosphorIconsBold.batteryWarning;
+      final batColor = _deviceStatus.charging ? C.ok : (bp >= 0 && bp <= 15 ? C.tally : (bp >= 0 && bp <= 30 ? C.warn : C.text));
+
+      final live = conn.isSelfLive;
+      final lost = _camera.smartZoomActive && _camera.tracker.lost;
+
+      return Row(children: [
+        GestureDetector(
+          onTap: () => setState(() => _showMetrics = !_showMetrics),
+          child: Semantics(
+            button: true, label: 'Connection $linkText. Tap for stream stats',
+            child: HudChip(
+              borderColor: linkColor.withValues(alpha: 0.6),
+              child: Row(children: [
+                Container(width: 8, height: 8, decoration: BoxDecoration(color: linkColor, shape: BoxShape.circle)),
+                const SizedBox(width: 6),
+                Text(linkText, style: T.hud.copyWith(color: linkColor)),
+              ]),
+            ),
           ),
         ),
-        ...shots.map((s) => Padding(
-              padding: const EdgeInsets.only(left: 6),
-              child: _pill(s.$1, (f.shotZoom - s.$2).abs() < 0.01, () { _camera.smartSetShot(s.$2); setState(() {}); }),
-            )),
-        const SizedBox(width: 10),
-        _pill(f.follow ? 'Follow ✓' : 'Follow', f.follow, () { _camera.smartSetFollow(!f.follow); setState(() {}); }),
-        const SizedBox(width: 6),
-        if (active) _pill('Release ✕', false, () { _camera.smartRelease(); setState(() {}); }),
-      ]),
+        const SizedBox(width: S.sm),
+        HudChip(child: Row(children: [
+          PhosphorIcon(wifiIcon, size: 16, color: C.text),
+          const SizedBox(width: 8),
+          PhosphorIcon(batIcon, size: 18, color: batColor),
+          if (bp >= 0) ...[const SizedBox(width: 4), Text('$bp%', style: T.hud.copyWith(color: batColor))],
+        ])),
+        const Spacer(),
+        // Tally — the one thing an operator must read from across the room.
+        AnimatedContainer(
+          duration: const Duration(milliseconds: 200),
+          height: 32,
+          padding: const EdgeInsets.symmetric(horizontal: 14),
+          decoration: BoxDecoration(
+            color: live ? C.tally : C.scrim,
+            borderRadius: BorderRadius.circular(R.sm),
+            border: Border.all(color: live ? C.tally : C.hairline),
+          ),
+          child: Row(mainAxisSize: MainAxisSize.min, children: [
+            PhosphorIcon(live ? PhosphorIconsFill.record : PhosphorIconsRegular.record, size: 14, color: live ? Colors.white : C.textDim),
+            const SizedBox(width: 6),
+            Text(live ? 'ON AIR' : 'STANDBY',
+                style: T.hud.copyWith(color: live ? Colors.white : C.textDim, letterSpacing: 1.4, fontWeight: FontWeight.w900)),
+          ]),
+        ),
+        if (lost) ...[
+          const SizedBox(width: S.sm),
+          HudChip(
+            borderColor: C.warn,
+            child: Row(children: [
+              PhosphorIcon(PhosphorIconsFill.warningCircle, size: 16, color: C.warn),
+              const SizedBox(width: 6),
+              Text('Subject lost', style: T.hud.copyWith(color: C.warn)),
+            ]),
+          ),
+        ],
+        const Spacer(),
+        // Secondary info — dropped while a panel narrows the viewfinder, so the
+        // link, battery and tally never get pushed off screen.
+        if (_tab == null) ...[
+          HudChip(child: Text(
+            '${_camera.measuredFps > 0 ? _camera.measuredFps : _camera.targetFps} FPS  ·  ${_camera.isH264Mode ? 'H.264' : 'MJPEG'}',
+            style: T.hud.copyWith(color: C.textDim),
+          )),
+          const SizedBox(width: 64), // keep clear of the tool rail column
+        ],
+      ]);
+    });
+  }
+
+  // ── Right tool rail ─────────────────────────────────────────────────────────
+  Widget _buildToolRail() {
+    Widget lockBadge() => Container(
+          width: 18, height: 18,
+          decoration: BoxDecoration(color: C.bg, shape: BoxShape.circle, border: Border.all(color: C.warn, width: 1.5)),
+          child: PhosphorIcon(PhosphorIconsFill.lockSimple, size: 10, color: C.warn),
+        );
+    return Column(mainAxisSize: MainAxisSize.min, children: [
+      ToolButton(
+        icon: PhosphorIconsRegular.userFocus, activeIcon: PhosphorIconsFill.userFocus,
+        label: _smartMode ? 'Smart Zoom on' : 'Smart Zoom',
+        active: _smartMode, onTap: _toggleSmartMode,
+      ),
+      const SizedBox(height: S.sm),
+      ToolButton(
+        icon: PhosphorIconsRegular.crosshair, activeIcon: PhosphorIconsBold.crosshair,
+        label: _camera.focusLocked ? 'Focus locked' : 'Lock focus',
+        active: _camera.focusLocked, activeColor: C.warn,
+        badge: _camera.focusLocked ? lockBadge() : null,
+        onTap: () => _camera.setFocusLocked(!_camera.focusLocked),
+      ),
+      const SizedBox(height: S.sm),
+      ToolButton(
+        icon: PhosphorIconsRegular.sun, activeIcon: PhosphorIconsFill.sun,
+        label: _camera.exposureLocked ? 'Exposure locked' : 'Lock exposure',
+        active: _camera.exposureLocked, activeColor: C.warn,
+        badge: _camera.exposureLocked ? lockBadge() : null,
+        onTap: () => _camera.setExposureLocked(!_camera.exposureLocked),
+      ),
+      const SizedBox(height: S.sm),
+      ToolButton(
+        icon: PhosphorIconsRegular.lightningSlash, activeIcon: PhosphorIconsFill.lightning,
+        label: _camera.torchOn ? 'Torch on' : 'Torch',
+        active: _camera.torchOn, activeColor: C.warn,
+        onTap: _camera.hasTorch ? () => _camera.toggleTorch() : null,
+      ),
+      const SizedBox(height: S.sm),
+      ToolButton(
+        icon: PhosphorIconsRegular.cameraRotate,
+        label: 'Switch lens',
+        onTap: () async {
+          await _camera.switchCamera();
+          if (mounted) setState(() => _smartMode = false);
+          _conn?.sendCapabilities(_camera.capabilities());
+          _reportPhoneState();
+        },
+      ),
+    ]);
+  }
+
+  // ── Zoom dial ───────────────────────────────────────────────────────────────
+  // Presets for one-tap framing, the live value in the middle, and the whole
+  // pill doubles as a scrubber: drag sideways to zoom smoothly.
+  Widget _buildZoomDial() {
+    final zMin = _camera.minZoom;
+    final zMax = _camera.maxZoom > zMin ? _camera.maxZoom : zMin + 1;
+    final presets = <double>[1, 2, 3, 5].where((z) => z >= zMin - 0.01 && z <= zMax + 0.01).toList();
+    final z = _camera.zoom;
+
+    Widget preset(double p) {
+      final on = (z - p).abs() < 0.05;
+      return Semantics(
+        button: true, selected: on, label: 'Zoom ${p.toStringAsFixed(0)} times',
+        child: GestureDetector(
+          onTap: () { HapticFeedback.selectionClick(); _animateZoom(p); },
+          child: AnimatedContainer(
+            duration: const Duration(milliseconds: 150),
+            width: 44, height: 44,
+            alignment: Alignment.center,
+            decoration: BoxDecoration(color: on ? C.text : Colors.transparent, shape: BoxShape.circle),
+            child: Text('${p.toStringAsFixed(0)}×', style: T.hud.copyWith(color: on ? C.accentInk : C.text, fontSize: 13)),
+          ),
+        ),
+      );
+    }
+
+    return GestureDetector(
+      onHorizontalDragStart: (_) => _baseZoom = _camera.zoom,
+      onHorizontalDragUpdate: (d) {
+        // ~260dp of drag sweeps the full range.
+        _baseZoom = (_baseZoom + d.delta.dx * (zMax - zMin) / 260).clamp(zMin, zMax);
+        _applyZoom(_baseZoom);
+      },
+      child: Container(
+        height: 56,
+        padding: const EdgeInsets.symmetric(horizontal: 6),
+        decoration: BoxDecoration(
+          color: const Color(0xB3000000),
+          borderRadius: BorderRadius.circular(R.pill),
+          border: Border.all(color: C.hairline),
+        ),
+        child: Row(mainAxisSize: MainAxisSize.min, children: [
+          _dialIcon(PhosphorIconsBold.minus, 'Zoom out', () => _applyZoom(z - (zMax - zMin) / 10)),
+          ...presets.map(preset),
+          Container(
+            margin: const EdgeInsets.symmetric(horizontal: 6),
+            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+            decoration: BoxDecoration(color: C.accentSoft, borderRadius: BorderRadius.circular(R.pill)),
+            child: Row(mainAxisSize: MainAxisSize.min, children: [
+              PhosphorIcon(PhosphorIconsBold.magnifyingGlass, size: 14, color: C.accent),
+              const SizedBox(width: 6),
+              Text('${z.toStringAsFixed(1)}×', style: T.zoom.copyWith(color: C.accent)),
+            ]),
+          ),
+          _dialIcon(PhosphorIconsBold.plus, 'Zoom in', () => _applyZoom(z + (zMax - zMin) / 10)),
+        ]),
+      ),
     );
   }
 
-  /// Live switcher: every camera the desktop can put on air (USB, IP, phones),
-  /// plus the transition used for the cut.
-  Widget _buildSwitcher() {
+  Widget _dialIcon(IconData icon, String label, VoidCallback onTap) => Semantics(
+        button: true, label: label,
+        child: GestureDetector(
+          onTap: () { HapticFeedback.selectionClick(); onTap(); },
+          child: SizedBox(width: 44, height: 44, child: PhosphorIcon(icon, size: 18, color: C.text)),
+        ),
+      );
+
+  // ── Side panel ──────────────────────────────────────────────────────────────
+  Widget _buildPanel() {
+    final t = _tab;
+    late final IconData icon;
+    late final String title;
+    Widget body = const SizedBox.shrink();
+    switch (t) {
+      case _Tab.live:
+        icon = PhosphorIconsFill.broadcast; title = 'Live cameras'; body = _livePanel();
+      case _Tab.smart:
+        icon = PhosphorIconsFill.userFocus; title = 'Smart Zoom'; body = _smartPanel();
+      case _Tab.image:
+        icon = PhosphorIconsFill.faders; title = 'Image'; body = _imagePanel();
+      case _Tab.studio:
+        icon = PhosphorIconsFill.projectorScreen; title = 'Studio'; body = const StudioPanel();
+      case _Tab.settings:
+        icon = PhosphorIconsFill.gearSix; title = 'Settings'; body = SettingsPanel(onDisconnect: _disconnect);
+      case null:
+        icon = PhosphorIconsFill.aperture; title = '';
+    }
+    return Material(
+      color: C.surface,
+      child: Container(
+        decoration: const BoxDecoration(border: Border(right: BorderSide(color: C.hairline))),
+        child: SafeArea(
+          left: false,
+          child: Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+            Padding(
+              padding: const EdgeInsets.fromLTRB(S.lg, S.md, S.sm, S.sm),
+              child: Row(children: [
+                PhosphorIcon(icon, size: 20, color: C.accent),
+                const SizedBox(width: S.sm),
+                Expanded(child: Text(title, style: T.title)),
+                Semantics(
+                  button: true, label: 'Close panel',
+                  child: IconButton(
+                    onPressed: () => setState(() => _tab = null),
+                    icon: PhosphorIcon(PhosphorIconsBold.x, size: 18, color: C.textDim),
+                  ),
+                ),
+              ]),
+            ),
+            Expanded(
+              child: SingleChildScrollView(
+                key: ValueKey(t), // each tab opens at its top
+                padding: const EdgeInsets.fromLTRB(S.lg, S.sm, S.lg, S.lg),
+                child: body,
+              ),
+            ),
+          ]),
+        ),
+      ),
+    );
+  }
+
+  // Live: every camera the desktop can put on air (incl. this phone) + the cut.
+  Widget _livePanel() {
     return Consumer<ConnectionService>(builder: (_, conn, __) {
       final cams = conn.desktopCameras;
-      return Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.start, children: [
-        SizedBox(
-          height: 46,
-          child: cams.isEmpty
-              ? const Center(child: Text('No cameras reported by the desktop yet', style: TextStyle(color: Colors.white54, fontSize: 12)))
-              : ListView(
-                  scrollDirection: Axis.horizontal,
-                  children: cams.map((c) {
-                    final live = conn.activeCameraId == c.id;
-                    final self = c.id == conn.selfCameraId;
-                    final icon = c.kind == 'ip' ? Icons.router : (c.kind == 'mobile' || c.kind == 'webrtc') ? Icons.smartphone : Icons.videocam;
-                    return Padding(
-                      padding: const EdgeInsets.only(right: 8, top: 4, bottom: 4),
-                      child: GestureDetector(
-                        onTap: () => conn.selectDesktopCamera(c.id),
-                        child: AnimatedContainer(
-                          duration: const Duration(milliseconds: 200),
-                          padding: const EdgeInsets.symmetric(horizontal: 12),
-                          decoration: BoxDecoration(
-                            color: live ? const Color(0xFFDC2626) : const Color(0xCC141423),
-                            borderRadius: BorderRadius.circular(10),
-                            border: Border.all(color: live ? const Color(0xFFEF4444) : (self ? _purple : Colors.white24), width: live || self ? 1.5 : 1),
-                          ),
-                          child: Row(mainAxisSize: MainAxisSize.min, children: [
-                            Icon(icon, color: Colors.white, size: 16),
-                            const SizedBox(width: 6),
-                            Text(self ? 'This phone' : c.label,
-                                style: TextStyle(color: Colors.white, fontSize: 12, fontWeight: live ? FontWeight.w800 : FontWeight.w500)),
-                            if (live) ...[
-                              const SizedBox(width: 6),
-                              const Text('LIVE', style: TextStyle(color: Colors.white, fontSize: 10, fontWeight: FontWeight.w900)),
-                            ],
-                          ]),
-                        ),
-                      ),
-                    );
-                  }).toList(),
-                ),
+      return Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+        PanelSection(
+          title: 'Put on air',
+          children: [
+            if (cams.isEmpty)
+              const Padding(
+                padding: EdgeInsets.symmetric(vertical: S.md),
+                child: Text('Waiting for the desktop to list its cameras…', style: T.body),
+              )
+            else
+              ...cams.map((c) {
+                final live = conn.activeCameraId == c.id;
+                final self = c.id == conn.selfCameraId;
+                final icon = c.kind == 'ip' ? PhosphorIconsRegular.videoCamera
+                    : (c.kind == 'mobile' || c.kind == 'webrtc') ? PhosphorIconsRegular.deviceMobileCamera
+                    : PhosphorIconsRegular.webcam;
+                return PanelTile(
+                  icon: icon,
+                  title: self ? 'This phone' : c.label,
+                  subtitle: self ? c.label : _kindLabel(c.kind),
+                  highlighted: live,
+                  highlightColor: C.tally,
+                  trailing: live
+                      ? Container(
+                          padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                          decoration: BoxDecoration(color: C.tally, borderRadius: BorderRadius.circular(R.sm)),
+                          child: const Text('LIVE', style: TextStyle(color: Colors.white, fontSize: 11, fontWeight: FontWeight.w900, letterSpacing: 1)),
+                        )
+                      : PhosphorIcon(PhosphorIconsBold.caretRight, size: 16, color: C.textFaint),
+                  onTap: live ? null : () => conn.selectDesktopCamera(c.id),
+                );
+              }),
+          ],
         ),
         if (conn.transitions.isNotEmpty)
-          SizedBox(
-            height: 38,
-            child: ListView(
-              scrollDirection: Axis.horizontal,
-              children: conn.transitions.map((t) => Padding(
-                    padding: const EdgeInsets.only(right: 6, top: 4, bottom: 4),
-                    child: _pill(t.labelAr.isNotEmpty ? t.labelAr : t.label, conn.switchTransition == t.id, () => conn.setSwitchTransition(t.id)),
-                  )).toList(),
-            ),
+          PanelSection(
+            title: 'Transition',
+            children: [
+              Wrap(spacing: S.sm, runSpacing: S.sm, children: conn.transitions.map((t) => Choice(
+                    label: t.labelAr.isNotEmpty ? t.labelAr : t.label,
+                    selected: conn.switchTransition == t.id,
+                    onTap: () => conn.setSwitchTransition(t.id),
+                  )).toList()),
+            ],
           ),
       ]);
     });
   }
 
-  Widget _miniBtn(IconData icon, VoidCallback onTap) => GestureDetector(
-        onTap: onTap,
-        child: Container(
-          width: 34, height: 34,
-          decoration: const BoxDecoration(color: Color(0xBF141423), shape: BoxShape.circle),
-          child: Icon(icon, color: Colors.white, size: 18),
-        ),
-      );
+  String _kindLabel(String kind) => switch (kind) {
+        'ip' => 'IP camera',
+        'mobile' => 'Phone',
+        'webrtc' => 'Phone (WebRTC)',
+        _ => 'USB camera',
+      };
 
-  Widget _pill(String label, bool active, VoidCallback onTap) => GestureDetector(
-        onTap: onTap,
-        child: Container(
-          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
-          decoration: BoxDecoration(
-            color: active ? _purple : const Color(0xBF141423),
-            borderRadius: BorderRadius.circular(14),
-            border: Border.all(color: active ? _purple : Colors.white24),
+  // Smart Zoom: arm, shot size, follow, release.
+  Widget _smartPanel() {
+    final f = _camera.framer;
+    final active = _camera.smartZoomActive;
+    final lost = active && _camera.tracker.lost;
+    final statusColor = lost ? C.warn : (active ? C.ok : C.textFaint);
+    final statusText = !_smartMode ? 'Off' : !active ? 'Tap a person on screen' : lost ? 'Subject lost — tap them again' : (f.follow ? 'Following' : 'Locked');
+    const shots = [
+      ('Wide', ShotSize.wide, PhosphorIconsRegular.usersThree),
+      ('Medium', ShotSize.medium, PhosphorIconsRegular.user),
+      ('Close', ShotSize.close, PhosphorIconsRegular.userFocus),
+    ];
+    return Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+      PanelTile(
+        icon: PhosphorIconsFill.userFocus,
+        title: 'Smart Zoom',
+        subtitle: statusText,
+        highlighted: _smartMode,
+        trailing: Switch(value: _smartMode, onChanged: (_) => _toggleSmartMode()),
+      ),
+      Padding(
+        padding: const EdgeInsets.only(bottom: S.xl, top: S.xs),
+        child: Row(children: [
+          Container(width: 8, height: 8, decoration: BoxDecoration(color: statusColor, shape: BoxShape.circle)),
+          const SizedBox(width: S.sm),
+          const Expanded(child: Text('Frames and follows one person with smooth, operator-style moves.', style: T.body)),
+        ]),
+      ),
+      PanelSection(
+        title: 'Shot size',
+        children: [
+          Wrap(spacing: S.sm, runSpacing: S.sm, children: shots.map((s) => Choice(
+                label: s.$1, icon: s.$3,
+                selected: (f.shotZoom - s.$2).abs() < 0.01,
+                onTap: () { _camera.smartSetShot(s.$2); setState(() {}); },
+              )).toList()),
+        ],
+      ),
+      PanelSection(
+        title: 'Behaviour',
+        children: [
+          PanelTile(
+            icon: PhosphorIconsRegular.personSimpleWalk,
+            title: 'Follow movement',
+            subtitle: f.follow ? 'Keeps the person framed as they move' : 'Holds the shot where you locked it',
+            trailing: Switch(value: f.follow, onChanged: (v) { _camera.smartSetFollow(v); setState(() {}); }),
           ),
-          child: Text(label, style: TextStyle(color: active ? Colors.black : Colors.white, fontSize: 12, fontWeight: FontWeight.w700)),
-        ),
-      );
-
-  Widget _filterSlider(String label, double value, double min, double max, ValueChanged<double> onChanged) => Row(children: [
-        SizedBox(width: 80, child: Text(label, style: const TextStyle(color: Colors.white70, fontSize: 11))),
-        Expanded(child: Slider(value: value.clamp(min, max), min: min, max: max, activeColor: _purple, onChanged: onChanged)),
-        SizedBox(width: 34, child: Text(value.round().toString(), style: const TextStyle(color: Colors.white54, fontSize: 11))),
-      ]);
-
-  Widget _circle(IconData icon, VoidCallback? onTap) => GestureDetector(
-        onTap: onTap,
-        child: Container(
-          width: 42, height: 42,
-          decoration: const BoxDecoration(color: Color(0xBF141423), shape: BoxShape.circle),
-          child: Icon(icon, color: onTap == null ? Colors.white30 : Colors.white, size: 20),
-        ),
-      );
-
-  /// Pill toggle (e.g. AF-L / AE-L). Amber when active to read as "locked".
-  Widget _labelToggle(String label, bool active, VoidCallback onTap) => GestureDetector(
-        onTap: onTap,
-        child: Container(
-          height: 42,
-          padding: const EdgeInsets.symmetric(horizontal: 12),
-          decoration: BoxDecoration(
-            color: active ? const Color(0xCCF59E0B) : const Color(0xBF141423),
-            borderRadius: BorderRadius.circular(21),
-            border: Border.all(
-                color: active ? const Color(0xFFF59E0B) : Colors.transparent, width: 1.5),
+          PanelTile(
+            icon: PhosphorIconsRegular.arrowsOutSimple,
+            title: 'Release',
+            subtitle: 'Glide back to the full picture',
+            onTap: active ? () { _camera.smartRelease(); setState(() {}); } : null,
           ),
-          alignment: Alignment.center,
-          child: Text(label,
-              style: TextStyle(
-                  color: active ? Colors.black : Colors.white,
-                  fontSize: 12, fontWeight: FontWeight.w800, letterSpacing: 0.5)),
+        ],
+      ),
+    ]);
+  }
+
+  // Image: looks + manual grading (applied to this phone's feed on the desktop).
+  Widget _imagePanel() {
+    return Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+      PanelSection(
+        title: 'Looks',
+        children: [
+          // 'Reset' is a duplicate of 'Natural' in the preset list — the Adjust
+          // section has its own Reset, so it's left out here.
+          Wrap(spacing: S.sm, runSpacing: S.sm, children: kFilterPresets.where((p) => p.name != 'Reset').map((p) => Choice(
+                label: p.name,
+                selected: _filters.toJson().toString() == p.filters.toJson().toString(),
+                onTap: () => _setFilters(p.filters),
+              )).toList()),
+        ],
+      ),
+      PanelSection(
+        title: 'Adjust',
+        trailing: TextButton.icon(
+          onPressed: () => _setFilters(CameraFilters.none),
+          icon: PhosphorIcon(PhosphorIconsBold.arrowCounterClockwise, size: 14, color: C.accent),
+          label: const Text('Reset', style: TextStyle(color: C.accent, fontWeight: FontWeight.w700)),
         ),
-      );
+        children: [
+          ValueSlider(icon: PhosphorIconsRegular.sun, label: 'Brightness', value: _filters.brightness, min: 0, max: 200, neutral: 100,
+              format: (v) => v.round().toString(), onChanged: (v) => _setFilters(_filters.copyWith(brightness: v))),
+          ValueSlider(icon: PhosphorIconsRegular.circleHalf, label: 'Contrast', value: _filters.contrast, min: 0, max: 200, neutral: 100,
+              format: (v) => v.round().toString(), onChanged: (v) => _setFilters(_filters.copyWith(contrast: v))),
+          ValueSlider(icon: PhosphorIconsRegular.drop, label: 'Saturation', value: _filters.saturation, min: 0, max: 200, neutral: 100,
+              format: (v) => v.round().toString(), onChanged: (v) => _setFilters(_filters.copyWith(saturation: v))),
+          ValueSlider(icon: PhosphorIconsRegular.dropHalfBottom, label: 'Blur', value: _filters.blur, min: 0, max: 10, neutral: 0,
+              format: (v) => v.toStringAsFixed(1), onChanged: (v) => _setFilters(_filters.copyWith(blur: v))),
+        ],
+      ),
+      PanelSection(
+        title: 'Locks',
+        children: [
+          PanelTile(
+            icon: PhosphorIconsRegular.crosshair, title: 'Focus lock',
+            subtitle: _camera.focusLocked ? 'Holding focus distance' : 'Continuous autofocus',
+            highlighted: _camera.focusLocked, highlightColor: C.warn,
+            trailing: Switch(value: _camera.focusLocked, onChanged: (v) => _camera.setFocusLocked(v)),
+          ),
+          PanelTile(
+            icon: PhosphorIconsRegular.sun, title: 'Exposure lock',
+            subtitle: _camera.exposureLocked ? 'Holding brightness' : 'Auto exposure',
+            highlighted: _camera.exposureLocked, highlightColor: C.warn,
+            trailing: Switch(value: _camera.exposureLocked, onChanged: (v) => _camera.setExposureLocked(v)),
+          ),
+        ],
+      ),
+    ]);
+  }
 
   void _disconnect() {
     context.read<ConnectionService>().disconnect();
     Navigator.of(context).pushNamedAndRemoveUntil('/', (r) => false);
   }
 
-  Widget _permissionDeniedView() => Center(child: Padding(
-        padding: const EdgeInsets.all(32),
+  // ── Full-screen states ──────────────────────────────────────────────────────
+  Widget _startingView() => const Center(
         child: Column(mainAxisSize: MainAxisSize.min, children: [
-          const Icon(Icons.camera_alt, color: Colors.white54, size: 64),
-          const SizedBox(height: 20),
-          const Text('Camera Permission Required', style: TextStyle(color: Colors.white, fontSize: 20, fontWeight: FontWeight.bold), textAlign: TextAlign.center),
-          const SizedBox(height: 12),
-          const Text('Church Cam needs camera access to stream video to the desktop.', style: TextStyle(color: Colors.white60), textAlign: TextAlign.center),
-          const SizedBox(height: 24),
-          ElevatedButton(onPressed: openCameraSettings, child: const Text('Open Settings')),
-          TextButton(onPressed: _disconnect, child: const Text('← Back')),
+          SizedBox(width: 28, height: 28, child: CircularProgressIndicator(strokeWidth: 2.5, color: C.accent)),
+          SizedBox(height: S.lg),
+          Text('Starting camera…', style: T.label),
         ]),
+      );
+
+  Widget _stateView({required IconData icon, required Color color, required String title, required String body, required List<Widget> actions}) =>
+      Center(child: ConstrainedBox(
+        constraints: const BoxConstraints(maxWidth: 440),
+        child: Padding(
+          padding: const EdgeInsets.all(S.xl),
+          child: Column(mainAxisSize: MainAxisSize.min, children: [
+            Container(
+              width: 64, height: 64,
+              decoration: BoxDecoration(color: color.withValues(alpha: 0.14), borderRadius: BorderRadius.circular(R.lg)),
+              child: PhosphorIcon(icon, size: 32, color: color),
+            ),
+            const SizedBox(height: S.lg),
+            Text(title, style: T.title.copyWith(fontSize: 20), textAlign: TextAlign.center),
+            const SizedBox(height: S.sm),
+            Text(body, style: T.body, textAlign: TextAlign.center),
+            const SizedBox(height: S.xl),
+            Wrap(spacing: S.md, runSpacing: S.sm, alignment: WrapAlignment.center, children: actions),
+          ]),
+        ),
       ));
 
-  Widget _errorView(String message) => Center(child: Padding(
-        padding: const EdgeInsets.all(32),
-        child: Column(mainAxisSize: MainAxisSize.min, children: [
-          const Icon(Icons.error_outline, color: Colors.redAccent, size: 64),
-          const SizedBox(height: 20),
-          Text(message, style: const TextStyle(color: Colors.white, fontSize: 16), textAlign: TextAlign.center),
-          const SizedBox(height: 24),
-          ElevatedButton(onPressed: _disconnect, child: const Text('← Back')),
-        ]),
-      ));
+  Widget _permissionDeniedView() => _stateView(
+        icon: PhosphorIconsFill.cameraSlash, color: C.warn,
+        title: 'Camera access needed',
+        body: 'Church Cam needs the camera to stream this phone to the desktop studio.',
+        actions: [
+          FilledButton.icon(onPressed: openCameraSettings, icon: PhosphorIcon(PhosphorIconsBold.gearSix, size: 16, color: C.accentInk), label: const Text('Open settings')),
+          TextButton(onPressed: _disconnect, child: const Text('Back')),
+        ],
+      );
+
+  Widget _errorView(String message) => _stateView(
+        icon: PhosphorIconsFill.warningCircle, color: C.tally,
+        title: 'Camera unavailable',
+        body: message,
+        actions: [FilledButton(onPressed: _disconnect, child: const Text('Back to connections'))],
+      );
 }
+
+enum _Tab { live, smart, image, studio, settings }
 
 /// Draws the Smart Zoom program frame over the full camera preview: everything
 /// outside the crop is dimmed, the crop gets broadcast-style corner marks, and
@@ -957,6 +1295,8 @@ class _FramingPainter extends CustomPainter {
 }
 
 class _FocusRing extends StatefulWidget {
+  const _FocusRing();
+
   @override
   State<_FocusRing> createState() => _FocusRingState();
 }
@@ -970,9 +1310,14 @@ class _FocusRingState extends State<_FocusRing> with SingleTickerProviderStateMi
   @override
   Widget build(BuildContext context) => ScaleTransition(
         scale: Tween(begin: 1.4, end: 1.0).animate(CurvedAnimation(parent: _c, curve: Curves.easeOut)),
+        // Square AF bracket (camera-native), not a generic circle.
         child: Container(
-          width: 60, height: 60,
-          decoration: BoxDecoration(shape: BoxShape.circle, border: Border.all(color: _purple, width: 2)),
+          width: 72, height: 72,
+          decoration: BoxDecoration(
+            borderRadius: BorderRadius.circular(R.sm),
+            border: Border.all(color: C.warn, width: 1.5),
+          ),
+          child: Center(child: Container(width: 4, height: 4, decoration: const BoxDecoration(color: C.warn, shape: BoxShape.circle))),
         ),
       );
 }

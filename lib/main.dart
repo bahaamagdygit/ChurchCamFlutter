@@ -4,6 +4,7 @@ import 'package:provider/provider.dart';
 import 'services/connection_service.dart';
 import 'screens/connect_screen.dart';
 import 'screens/home_shell.dart';
+import 'ui/tokens.dart';
 
 void main() {
   WidgetsFlutterBinding.ensureInitialized();
@@ -27,14 +28,7 @@ class ChurchCamApp extends StatelessWidget {
       child: MaterialApp(
         title: 'Church Cam',
         debugShowCheckedModeBanner: false,
-        theme: ThemeData(
-          brightness: Brightness.dark,
-          colorScheme: ColorScheme.fromSeed(
-            seedColor: const Color(0xFF4F46E5),
-            brightness: Brightness.dark,
-          ),
-          useMaterial3: true,
-        ),
+        theme: buildAppTheme(),
         initialRoute: '/',
         routes: {
           '/': (_) => const ConnectScreen(),
