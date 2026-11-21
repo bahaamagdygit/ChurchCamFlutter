@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Brand accent (same indigo as the app UI and desktop studio). -->
+    <color name="ic_launcher_background">#8B93FA</color>
+</resources>

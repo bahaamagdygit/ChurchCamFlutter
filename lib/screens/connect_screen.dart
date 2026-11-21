@@ -8,6 +8,7 @@ import '../services/storage.dart';
 import '../utils/pairing.dart';
 import '../utils/permissions.dart';
 import '../ui/tokens.dart';
+import '../ui/components.dart';
 import 'qr_scan_screen.dart';
 
 /// First screen: pick the desktop studio to stream to.
@@ -229,10 +230,12 @@ class _ConnectScreenState extends State<ConnectScreen> {
               child: SingleChildScrollView(
                 child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
                   Row(children: [
-                    Container(
-                      width: 48, height: 48,
-                      decoration: BoxDecoration(color: C.accent, borderRadius: BorderRadius.circular(R.md)),
-                      child: PhosphorIcon(PhosphorIconsFill.aperture, size: 28, color: C.accentInk),
+                    // The app logo itself, so the first screen matches the
+                    // launcher icon the operator just tapped.
+                    Semantics(
+                      label: 'Church Cam logo',
+                      image: true,
+                      child: Image.asset('assets/brand/app_mark.png', width: 52, height: 52, filterQuality: FilterQuality.medium),
                     ),
                     const SizedBox(width: S.md),
                     const Expanded(
@@ -257,6 +260,8 @@ class _ConnectScreenState extends State<ConnectScreen> {
                     title: 'Enter IP address',
                     onTap: () => _showAddDialog(),
                   ),
+                  const SizedBox(height: S.xl),
+                  const BuiltByCredit(),
                 ]),
               ),
             ),

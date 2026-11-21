@@ -196,6 +196,8 @@ class _SettingsPanelState extends State<SettingsPanel> {
         const SizedBox(width: 6),
         const Text('Church Cam  ·  v1.0.0', style: T.caption),
       ]),
+      const SizedBox(height: S.sm),
+      const BuiltByCredit(),
     ]);
   }
 

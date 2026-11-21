@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <rect width="1024" height="1024" rx="232" fill="#8B93FA"/>
+  
+  <clipPath id="rim"><circle cx="512" cy="512" r="330"/></clipPath>
+  <circle cx="512" cy="512" r="330" fill="#0B0B14"/>
+  <polygon points="536.6,372.3 645.3,463.5 620.7,603.2 487.4,651.7 378.7,560.5 403.3,420.8" fill="#8B93FA"/>
+  <g clip-path="url(#rim)" stroke="#8B93FA" stroke-width="16.5" stroke-linecap="round"><line x1="536.6" y1="372.3" x2="908.8" y2="236.8"/><line x1="645.3" y1="463.5" x2="948.7" y2="718.0"/><line x1="620.7" y1="603.2" x2="551.9" y2="993.2"/><line x1="487.4" y1="651.7" x2="115.2" y2="787.2"/><line x1="378.7" y1="560.5" x2="75.3" y2="306.0"/><line x1="403.3" y1="420.8" x2="472.1" y2="30.8"/></g>
+  <g fill="#0B0B14"><rect x="490.7" y="404.3" width="42.6" height="207.2" rx="8.5"/><rect x="442.5" y="445.1" width="139.1" height="42.6" rx="8.5"/></g>
+  <circle cx="776.0" cy="248.0" r="56.1" fill="#FF3B30" stroke="#8B93FA" stroke-width="19.8"/>
+</svg>

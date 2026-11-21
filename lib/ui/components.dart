@@ -3,6 +3,22 @@ import 'package:flutter/services.dart';
 import 'package:phosphor_flutter/phosphor_flutter.dart';
 import 'tokens.dart';
 
+/// Author credit, shown on the connect screen and in Settings.
+class BuiltByCredit extends StatelessWidget {
+  const BuiltByCredit({super.key});
+
+  @override
+  Widget build(BuildContext context) => Row(mainAxisSize: MainAxisSize.min, children: [
+        PhosphorIcon(PhosphorIconsFill.code, size: 14, color: C.accent),
+        const SizedBox(width: 6),
+        const Text(
+          'تم البناء بواسطة البشمهندس بهاء',
+          textDirection: TextDirection.rtl,
+          style: TextStyle(color: C.textDim, fontSize: 12.5, fontWeight: FontWeight.w600),
+        ),
+      ]);
+}
+
 /// Round icon control that floats over the viewfinder (tool rail, top bar).
 /// 48dp touch target; "on" fills with the accent (or [activeColor]) and swaps
 /// to the icon's filled variant so state reads at a glance, not by colour alone.
