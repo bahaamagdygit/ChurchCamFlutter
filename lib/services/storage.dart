@@ -262,3 +262,17 @@ Future<List<SavedConnection>> renameSavedConnection(String id, String name) asyn
   }
   return list;
 }
+
+/// Persistent per-install id. Sent in the hello so the desktop recognises this
+/// phone across reconnects (keeps it on air instead of treating it as new).
+Future<String> loadClientId() async {
+  final prefs = await SharedPreferences.getInstance();
+  var id = prefs.getString('churchcam.clientId');
+  if (id == null || id.isEmpty) {
+    final r = DateTime.now().microsecondsSinceEpoch.toRadixString(36);
+    final salt = (DateTime.now().hashCode ^ r.hashCode).toUnsigned(32).toRadixString(36);
+    id = '$r$salt';
+    await prefs.setString('churchcam.clientId', id);
+  }
+  return id;
+}

@@ -4,6 +4,7 @@ import 'dart:io';
 import 'dart:convert';
 import 'package:web_socket_channel/web_socket_channel.dart';
 import 'video_protocol.dart';
+import 'storage.dart' show loadClientId;
 
 enum ConnectionStatus { idle, connecting, connected, error, reconnecting }
 enum LinkQuality { excellent, good, fair, poor, disconnected }
@@ -64,6 +65,7 @@ class ConnectionService extends ChangeNotifier {
   int _videoPort = VIDEO_PORT;
   String _deviceId = '';
   String _deviceName = 'Mobile Camera (Flutter)';
+  String? _clientId;
 
   WebSocketChannel? _ws;
   Socket? _videoSocket;
@@ -84,7 +86,7 @@ class ConnectionService extends ChangeNotifier {
   // Tolerant of brief stalls (large H.264 keyframes can delay a pong). 6 misses
   // (≈6s) before forcing a reconnect, matching the desktop side — prevents a
   // reconnect spiral that restarts the encoder and floods the link.
-  static const int MAX_MISSED_PONGS = 6;
+  static const int MAX_MISSED_PONGS = 4;
 
   // Capabilities advertised to the desktop during handshake.
   Map<String, dynamic> _capabilities = {};
@@ -228,8 +230,14 @@ class ConnectionService extends ChangeNotifier {
       _controlPort = controlPort;
       _videoPort = videoPort;
 
-      setStatus(ConnectionStatus.connecting);
+      // Reconnects keep showing "Reconnecting" (not "Connecting") in the UI.
+      if (_status != ConnectionStatus.reconnecting) setStatus(ConnectionStatus.connecting);
       _log('Connecting to $host (control=$controlPort, video=$videoPort)');
+      _clientId ??= await loadClientId();
+
+      // Fully drop any previous sockets first. Leaving them to close "whenever"
+      // is what let a stale socket's late close tear down the fresh connection.
+      _dropSockets();
 
       final wsUrl = 'ws://$host:$controlPort';
       try {
@@ -259,7 +267,7 @@ class ConnectionService extends ChangeNotifier {
     final completer = Completer<String>();
     var resolved = false;
 
-    final timeout = Timer(const Duration(seconds: 10), () {
+    final timeout = Timer(const Duration(seconds: 5), () {
       if (!resolved) {
         resolved = true;
         if (!completer.isCompleted) {
@@ -269,17 +277,25 @@ class ConnectionService extends ChangeNotifier {
     });
 
     try {
-      _ws = WebSocketChannel.connect(Uri.parse(wsUrl));
+      final ch = WebSocketChannel.connect(Uri.parse(wsUrl));
+      _ws = ch;
 
-      _ws!.stream.listen(
-        (data) => _onControlMessage(data, () {
-          if (!resolved) {
-            resolved = true;
-            timeout.cancel();
-            completer.complete(_deviceId);
-          }
-        }),
+      // Every handler checks it still belongs to the CURRENT channel. A
+      // replaced channel finishing late used to call _scheduleReconnect(),
+      // which closed the brand-new connection — a reconnect loop.
+      ch.stream.listen(
+        (data) {
+          if (!identical(_ws, ch)) return;
+          _onControlMessage(data, () {
+            if (!resolved) {
+              resolved = true;
+              timeout.cancel();
+              completer.complete(_deviceId);
+            }
+          });
+        },
         onError: (error) {
+          if (!identical(_ws, ch)) return;
           _log('WebSocket error: $error');
           if (!resolved) {
             resolved = true;
@@ -290,6 +306,7 @@ class ConnectionService extends ChangeNotifier {
           }
         },
         onDone: () {
+          if (!identical(_ws, ch)) return;
           _log('WebSocket closed');
           if (!resolved) {
             resolved = true;
@@ -307,6 +324,9 @@ class ConnectionService extends ChangeNotifier {
       // the desktop's view without operator action.
       final hello = <String, dynamic>{
         'type': 'hello',
+        // Stable identity → the desktop gives us back the same deviceId on a
+        // reconnect, so this phone stays on air through a Wi-Fi blip.
+        'clientId': _clientId,
         'name': _deviceName,
         'platform': 'Android',
         'capabilities': _capabilities,
@@ -448,11 +468,17 @@ class ConnectionService extends ChangeNotifier {
 
   Future<void> _connectVideoStream(String host, int port, String deviceId) async {
     _videoHeaderSent = false;
+    // Never leave two video sockets alive: the old one is replaced, not leaked.
+    final old = _videoSocket;
+    _videoSocket = null;
+    try { old?.destroy(); } catch (_) {}
+    _pendingBytes = 0;
+    _flushing = false;
     try {
       _log('Connecting video stream: $host:$port');
-      _videoSocket = await Socket.connect(host, port,
-          timeout: const Duration(seconds: 5));
-      _videoSocket!.setOption(SocketOption.tcpNoDelay, true);
+      final sock = await Socket.connect(host, port, timeout: const Duration(seconds: 4));
+      sock.setOption(SocketOption.tcpNoDelay, true);
+      _videoSocket = sock;
 
       // Send the 32-byte ASCII deviceId header (zero-padded).
       final idBytes = utf8.encode(deviceId);
@@ -460,7 +486,7 @@ class ConnectionService extends ChangeNotifier {
       for (int i = 0; i < idBytes.length && i < 32; i++) {
         header[i] = idBytes[i];
       }
-      _videoSocket!.add(header);
+      sock.add(header);
       _videoHeaderSent = true;
       _log('Video stream connected ✓ (header sent)');
 
@@ -469,27 +495,39 @@ class ConnectionService extends ChangeNotifier {
       // desktop decoder can (re)initialize without waiting ~1s for the next IDR.
       try { onVideoReady?.call(); } catch (_) {}
 
-      _videoSocket!.listen(
-        (_) {},
-        onError: (error) {
-          _log('Video socket error: $error');
-          _videoSocket = null;
-          _videoHeaderSent = false;
-          _reconnectVideoStream();
-        },
-        onDone: () {
-          _log('Video socket closed');
-          _videoSocket = null;
-          _videoHeaderSent = false;
-          _reconnectVideoStream();
-        },
-      );
+      // Handlers only act if this is still THE video socket — a superseded
+      // socket closing late used to null out the new one (frames silently
+      // dropped) and spawn yet another connection.
+      void lost(String why) {
+        if (!identical(_videoSocket, sock)) return;
+        _log('Video socket $why');
+        _videoSocket = null;
+        _videoHeaderSent = false;
+        _pendingBytes = 0;
+        _flushing = false;
+        _reconnectVideoStream();
+      }
+      sock.listen((_) {}, onError: (error) => lost('error: $error'), onDone: () => lost('closed'), cancelOnError: true);
     } catch (e) {
       _videoSocket = null;
       _videoHeaderSent = false;
       _log('Video connection failed: $e');
       rethrow;
     }
+  }
+
+  /// Close both sockets without triggering reconnect logic (their handlers
+  /// see they're no longer current and stay quiet).
+  void _dropSockets() {
+    final ws = _ws;
+    _ws = null;
+    try { ws?.sink.close(); } catch (_) {}
+    final v = _videoSocket;
+    _videoSocket = null;
+    _videoHeaderSent = false;
+    _pendingBytes = 0;
+    _flushing = false;
+    try { v?.destroy(); } catch (_) {}
   }
 
   // Backpressure tracking: how many bytes we've handed to the socket that
@@ -706,9 +744,11 @@ class ConnectionService extends ChangeNotifier {
     _send({'type': 'control', 'action': action, 'value': value});
   }
 
-  // Exponential backoff: 500ms → ×2 → cap 5000ms, retry indefinitely (Section 2).
-  static const int RECONNECT_BASE_MS = 500;
-  static const int RECONNECT_MAX_MS = 5000;
+  // Exponential backoff: 250ms → ×2 → cap 2000ms, retry indefinitely. Short
+  // cap on purpose: the desktop holds this phone's session (and its place on
+  // air) for 20s, so getting back fast matters more than politeness.
+  static const int RECONNECT_BASE_MS = 250;
+  static const int RECONNECT_MAX_MS = 2000;
 
   void _scheduleReconnect() {
     if (_status == ConnectionStatus.idle) return; // user disconnected
@@ -721,8 +761,7 @@ class ConnectionService extends ChangeNotifier {
     setStatus(ConnectionStatus.reconnecting);
 
     _pingTimer?.cancel();
-    try { _ws?.sink.close(); } catch (_) {}
-    _ws = null;
+    _dropSockets();
 
     _reconnectTimer = Timer(Duration(milliseconds: delayMs), () async {
       if (_host.isEmpty || _status == ConnectionStatus.idle) return;
@@ -731,13 +770,19 @@ class ConnectionService extends ChangeNotifier {
     });
   }
 
+  bool _videoReconnecting = false;
   void _reconnectVideoStream() {
     if (_status != ConnectionStatus.connected) return;
     if (_host.isEmpty || _deviceId.isEmpty) return;
+    if (_videoReconnecting) return; // one retry loop at a time
+    _videoReconnecting = true;
     _log('Reconnecting video stream...');
-    _connectVideoStream(_host, _videoPort, _deviceId).catchError((e) {
+    _connectVideoStream(_host, _videoPort, _deviceId).then((_) {
+      _videoReconnecting = false;
+    }).catchError((e) {
+      _videoReconnecting = false;
       _log('Video reconnect failed: $e');
-      Future.delayed(const Duration(seconds: 2), _reconnectVideoStream);
+      Future.delayed(const Duration(milliseconds: 600), _reconnectVideoStream);
     });
   }
 

@@ -137,6 +137,8 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
     if (_settings.stabilize) _camera.setStabilize(true);
     if (_settings.levelOn) _startLevel();
     _audio.onPcm = (pcm) => _conn?.sendAudio(pcm);
+    // Keep the Wi-Fi radio awake for the whole session (no power-save naps).
+    _setWifiLock(true);
     _audio.addListener(_onAudioLevel);
     if (_settings.audioEnabled) _setAudio(true, persist: false);
     _camera.onIsoFinished = _saveIsoToGallery;
@@ -237,6 +239,11 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
       'audio': _audio.running,
       'stabilize': _camera.stabilizeOn,
     });
+  }
+
+  static const _net = MethodChannel('churchcam/net');
+  void _setWifiLock(bool on) {
+    _net.invokeMethod('wifiLock', on).catchError((_) => false);
   }
 
   // ── Settings persistence ────────────────────────────────────────────────────
@@ -730,6 +737,7 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
     _stateReportTimer?.cancel();
     _camera.onSmartZoomChanged = null;
     _camera.onAids = null;
+    _setWifiLock(false);
     _camera.onIsoFinished = null;
     _directorTimer?.cancel();
     _isoTicker?.cancel();

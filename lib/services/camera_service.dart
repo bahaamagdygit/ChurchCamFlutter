@@ -3,6 +3,7 @@ import 'dart:ui' show Offset, Rect;
 import 'package:flutter/foundation.dart';
 import 'package:camera/camera.dart';
 import 'jpeg_encoder.dart';
+import 'native_jpeg.dart';
 import 'h264_encoder_channel.dart';
 import 'cam2_encoder_channel.dart';
 import 'smart_framer.dart';
@@ -25,6 +26,10 @@ class CameraService extends ChangeNotifier {
   DateTime _lastSent = DateTime.fromMillisecondsSinceEpoch(0);
 
   JpegEncoder _encoder = JpegEncoder();
+  final NativeJpegEncoder _native = NativeJpegEncoder();
+  // Frames skipped because the network was still busy with the previous one
+  // (counted between adaptive-quality ticks).
+  int _netSkips = 0;
   bool _encoderReady = false;
 
   // ── H.264 mode ───────────────────────────────────────────────────────────────
@@ -208,12 +213,12 @@ class CameraService extends ChangeNotifier {
   }
 
   /// Capture resolution for the MJPEG path, from the user's quality setting.
-  /// Capped at 1080p: output is ≤1024 wide anyway, the extra resolution is
-  /// there so digital zoom / Smart Zoom crops stay sharp.
   void setCaptureLongEdge(int longEdge) {
-    _preset = longEdge >= 1920 ? ResolutionPreset.veryHigh
-        : longEdge >= 1280 ? ResolutionPreset.high
-        : ResolutionPreset.medium;
+    // Capped at 720p for MJPEG: the stream is ≤1024 px wide anyway, and 1080p
+    // capture means pushing ~3 MB of raw planes per frame through the app
+    // (~90 MB/s at 30 fps) — a real source of dropped frames and delay on
+    // mid-range phones. Smoothness wins; 720p still leaves room for crops.
+    _preset = longEdge >= 1280 ? ResolutionPreset.high : ResolutionPreset.medium;
   }
 
   bool _torchOn = false;
@@ -515,7 +520,10 @@ class CameraService extends ChangeNotifier {
 
     // FPS throttle (shared by both codecs).
     final now = DateTime.now();
-    final minGapMs = (1000 / _targetFps).round();
+    // 75% of the frame interval: the camera delivers ~every 33 ms with
+    // jitter, and a strict 33 ms gate rejected every early-by-1ms frame —
+    // which quietly halved the frame rate into a stutter.
+    final minGapMs = (1000 / _targetFps * 0.75).round();
     if (now.difference(_lastSent).inMilliseconds < minGapMs) return;
 
     // ── H.264 path ──────────────────────────────────────────────────────────
@@ -574,7 +582,7 @@ class CameraService extends ChangeNotifier {
     // Backpressure: never queue. If a frame is still encoding, or the network
     // can't take more, drop this one — realtime beats backlog.
     if (_frameInFlight) return;
-    if (canSendFrame != null && !canSendFrame!()) return;
+    if (canSendFrame != null && !canSendFrame!()) { _netSkips++; return; }
 
     _frameInFlight = true;
     _lastSent = now;
@@ -583,7 +591,11 @@ class CameraService extends ChangeNotifier {
     if (raw == null) { _frameInFlight = false; return; }
 
     final encodeStart = DateTime.now();
-    _encoder.encode(raw).then((jpeg) {
+    // Native (hardware-speed) encoder first; the Dart isolate is the fallback.
+    final Future<Uint8List?> job = _native.available
+        ? _native.encode(raw).then<Uint8List?>((j) async => j ?? await _encoder.encode(raw))
+        : _encoder.encode(raw);
+    job.then((jpeg) {
       // Rolling encode-time average + measured FPS (metrics only).
       final ms = DateTime.now().difference(encodeStart).inMilliseconds.toDouble();
       _avgEncodeMs = _avgEncodeMs == 0 ? ms : (_avgEncodeMs * 0.8 + ms * 0.2);
@@ -630,21 +642,37 @@ class CameraService extends ChangeNotifier {
   /// step DOWN above 60KB (link struggling), step UP when sustained below 20KB.
   /// Bounds: q55-85, 20-30fps.
   void reportBacklog(int pendingBytes) {
-    if (pendingBytes > 60 * 1024) {
+    // Driven by frames the network actually had to skip since the last tick
+    // (~400 ms), not by a single snapshot of the socket backlog — a snapshot
+    // taken right after a frame was handed off read as "congested" and kept
+    // dropping fps/quality for no reason.
+    final skips = _netSkips;
+    _netSkips = 0;
+    if (skips >= 3) {
       _lowBacklogStreak = 0;
-      final newQ = (_jpegQuality - 5).clamp(_minQuality, _maxQuality);
-      final newF = (_targetFps - 5).clamp(_minFps, _maxFps);
+      // Smoothness first: shed picture quality before frame rate.
+      int newQ = _jpegQuality, newF = _targetFps;
+      if (_jpegQuality > _minQuality) {
+        newQ = (_jpegQuality - 8).clamp(_minQuality, _maxQuality);
+      } else {
+        newF = (_targetFps - 5).clamp(_minFps, _maxFps);
+      }
       if (newQ != _jpegQuality || newF != _targetFps) {
         _jpegQuality = newQ; _targetFps = newF;
-        debugPrint('[Adaptive] backlog ${(pendingBytes/1024).round()}KB → q$_jpegQuality ${_targetFps}fps (down)');
+        debugPrint('[Adaptive] $skips frames skipped → q$_jpegQuality ${_targetFps}fps (down)');
         notifyListeners();
       }
-    } else if (pendingBytes < 20 * 1024) {
+    } else if (skips == 0) {
       _lowBacklogStreak++;
-      if (_lowBacklogStreak >= 3) {
+      if (_lowBacklogStreak >= 4) {
         _lowBacklogStreak = 0;
-        final newQ = (_jpegQuality + 5).clamp(_minQuality, _maxQuality);
-        final newF = (_targetFps + 5).clamp(_minFps, _maxFps);
+        // Recover frame rate first, then quality.
+        int newQ = _jpegQuality, newF = _targetFps;
+        if (_targetFps < _maxFps) {
+          newF = (_targetFps + 5).clamp(_minFps, _maxFps);
+        } else {
+          newQ = (_jpegQuality + 4).clamp(_minQuality, _maxQuality);
+        }
         if (newQ != _jpegQuality || newF != _targetFps) {
           _jpegQuality = newQ; _targetFps = newF;
           debugPrint('[Adaptive] link clear → q$_jpegQuality ${_targetFps}fps (up)');

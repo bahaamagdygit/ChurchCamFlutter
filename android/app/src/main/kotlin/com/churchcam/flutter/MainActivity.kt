@@ -24,6 +24,9 @@ class MainActivity : FlutterActivity() {
     private var auSink: EventChannel.EventSink? = null
     private var audio: AudioStreamer? = null
     private var audioSink: EventChannel.EventSink? = null
+    private val jpegExecutor = java.util.concurrent.Executors.newSingleThreadExecutor()
+    private val mainHandler = android.os.Handler(android.os.Looper.getMainLooper())
+    private var wifiLock: WifiManager.WifiLock? = null
 
     override fun configureFlutterEngine(@NonNull flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
@@ -41,6 +44,61 @@ class MainActivity : FlutterActivity() {
         )
 
         // Device info channel — WiFi signal strength (RSSI → 0..4 bars + dBm).
+        // Hardware-speed JPEG encoding for the MJPEG stream (see NativeJpeg).
+        // Runs on its own thread so the platform thread never stalls.
+        MethodChannel(messenger, "churchcam/jpeg").setMethodCallHandler { call, result ->
+            if (call.method != "encode") { result.notImplemented(); return@setMethodCallHandler }
+            val a = call.arguments as? Map<*, *>
+            if (a == null) { result.error("args", "missing", null); return@setMethodCallHandler }
+            jpegExecutor.execute {
+                try {
+                    val jpeg = NativeJpeg.encode(
+                        a["y"] as ByteArray, a["u"] as ByteArray, a["v"] as ByteArray,
+                        (a["w"] as Number).toInt(), (a["h"] as Number).toInt(),
+                        (a["yStride"] as Number).toInt(), (a["uvStride"] as Number).toInt(),
+                        (a["uvPixStride"] as Number).toInt(),
+                        (a["cropX"] as Number).toDouble(), (a["cropY"] as Number).toDouble(),
+                        (a["cropW"] as Number).toDouble(), (a["cropH"] as Number).toDouble(),
+                        (a["outW"] as Number).toInt(), (a["outH"] as Number).toInt(),
+                        (a["quality"] as Number).toInt(), a["mirror"] == true,
+                        (a["rotation"] as Number).toInt(),
+                    )
+                    mainHandler.post { result.success(jpeg) }
+                } catch (e: Throwable) {
+                    mainHandler.post { result.error("encode", e.message, null) }
+                }
+            }
+        }
+
+        // Keep Wi-Fi out of power-save while streaming. Android otherwise
+        // naps the radio between packets, which shows up as bursty frames and
+        // 100–300 ms latency spikes.
+        MethodChannel(messenger, "churchcam/net").setMethodCallHandler { call, result ->
+            when (call.method) {
+                "wifiLock" -> {
+                    val on = call.arguments == true
+                    try {
+                        if (on) {
+                            if (wifiLock == null) {
+                                val wm = applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
+                                @Suppress("DEPRECATION")
+                                val mode = if (android.os.Build.VERSION.SDK_INT >= 29)
+                                    WifiManager.WIFI_MODE_FULL_LOW_LATENCY else WifiManager.WIFI_MODE_FULL_HIGH_PERF
+                                wifiLock = wm.createWifiLock(mode, "churchcam:stream").apply { setReferenceCounted(false) }
+                            }
+                            if (wifiLock?.isHeld != true) wifiLock?.acquire()
+                        } else {
+                            if (wifiLock?.isHeld == true) wifiLock?.release()
+                        }
+                        result.success(true)
+                    } catch (e: Exception) {
+                        result.success(false)
+                    }
+                }
+                else -> result.notImplemented()
+            }
+        }
+
         // Microphone PCM for the desktop's stream audio (see AudioStreamer).
         EventChannel(messenger, "churchcam/audio/pcm").setStreamHandler(
             object : EventChannel.StreamHandler {
@@ -186,6 +244,8 @@ class MainActivity : FlutterActivity() {
         try { cam2?.stop() } catch (_: Exception) {}
         try { encoder?.stop() } catch (_: Exception) {}
         try { audio?.stop() } catch (_: Exception) {}
+        try { if (wifiLock?.isHeld == true) wifiLock?.release() } catch (_: Exception) {}
+        jpegExecutor.shutdown()
         super.onDestroy()
     }
 }
