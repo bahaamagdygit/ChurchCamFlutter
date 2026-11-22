@@ -512,7 +512,22 @@ class CameraService extends ChangeNotifier {
   // Monotonic-ish capture clock base (µs) for AU/JPEG timestamps.
   final int _epochUs = DateTime.now().microsecondsSinceEpoch;
 
+  // Debug-only pipeline counters: frames delivered by the camera vs encoded.
+  int _dbgIn = 0, _dbgAt = 0;
+
   void _onCameraImage(CameraImage image) {
+    if (kDebugMode) {
+      _dbgIn++;
+      final t = DateTime.now().millisecondsSinceEpoch;
+      if (_dbgAt == 0) _dbgAt = t;
+      if (t - _dbgAt >= 3000) {
+        debugPrint('[Pipeline] camera ${(_dbgIn * 1000 / (t - _dbgAt)).toStringAsFixed(1)} fps in, '
+            'encode ${_avgEncodeMs.toStringAsFixed(0)} ms avg, sent $_measuredFps fps, '
+            '${image.width}x${image.height}, native=${_native.available}');
+        _dbgIn = 0;
+        _dbgAt = t;
+      }
+    }
     // Smart Zoom / digital zoom runs on EVERY delivered frame (before the
     // throttles below), so tracking and camera motion stay smooth even when
     // the network is dropping frames.

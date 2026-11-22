@@ -67,70 +67,23 @@ class _ConnectScreenState extends State<ConnectScreen> {
   }
 
   // ── Manual add / rename / delete ────────────────────────────────────────────
-  void _showAddDialog({String prefillHost = ''}) {
-    final nameCtrl = TextEditingController();
-    final hostCtrl = TextEditingController(text: prefillHost);
-    String? error;
-    showDialog(
-      context: context,
-      builder: (ctx) => StatefulBuilder(builder: (ctx, setD) => AlertDialog(
-        title: const Text('Add a studio', style: T.title),
-        // Scrollable: in landscape the keyboard leaves very little height, and
-        // a fixed Column overflowed off the bottom of the dialog.
-        content: SingleChildScrollView(
-          child: SizedBox(
-            width: 360,
-            child: Column(mainAxisSize: MainAxisSize.min, children: [
-              TextField(
-                controller: nameCtrl,
-                style: const TextStyle(color: C.text),
-                textInputAction: TextInputAction.next,
-                decoration: InputDecoration(
-                  labelText: 'Name (optional)',
-                  hintText: 'e.g. Main hall',
-                  prefixIcon: Padding(padding: const EdgeInsets.all(12), child: PhosphorIcon(PhosphorIconsRegular.tag, size: 18, color: C.textDim)),
-                ),
-              ),
-              const SizedBox(height: S.md),
-              TextField(
-                controller: hostCtrl,
-                autofocus: prefillHost.isEmpty,
-                style: const TextStyle(color: C.text),
-                keyboardType: TextInputType.url,
-                autocorrect: false,
-                decoration: InputDecoration(
-                  labelText: 'Desktop IP address',
-                  hintText: '192.168.1.42',
-                  errorText: error,
-                  prefixIcon: Padding(padding: const EdgeInsets.all(12), child: PhosphorIcon(PhosphorIconsRegular.desktop, size: 18, color: C.textDim)),
-                ),
-              ),
-            ]),
-          ),
-        ),
-        actions: [
-          TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Cancel')),
-          FilledButton(
-            onPressed: () async {
-              final pairing = parsePairing(hostCtrl.text);
-              if (pairing == null) {
-                setD(() => error = 'Enter an IP like 192.168.1.42');
-                return;
-              }
-              Navigator.pop(ctx);
-              await addSavedConnection(
-                name: nameCtrl.text.trim().isEmpty ? 'Studio' : nameCtrl.text.trim(),
-                host: pairing.host,
-                controlPort: pairing.controlPort,
-                videoPort: pairing.videoPort,
-              );
-              await _refresh();
-            },
-            child: const Text('Save studio'),
-          ),
-        ],
-      )),
+  // A full page, not a dialog: in landscape the keyboard covers ~¾ of the
+  // screen, so a dialog's field ended up hidden behind it. Here the field sits
+  // right under a header that carries the Save action — always visible.
+  Future<void> _showAddDialog({String prefillHost = ''}) async {
+    final result = await Navigator.of(context).push<(String, String)>(
+      MaterialPageRoute(fullscreenDialog: true, builder: (_) => _AddStudioPage(prefillHost: prefillHost)),
     );
+    if (result == null) return;
+    final pairing = parsePairing(result.$2);
+    if (pairing == null) return;
+    await addSavedConnection(
+      name: result.$1.isEmpty ? 'Studio' : result.$1,
+      host: pairing.host,
+      controlPort: pairing.controlPort,
+      videoPort: pairing.videoPort,
+    );
+    await _refresh();
   }
 
   void _showRenameDialog(SavedConnection conn) {
@@ -452,6 +405,89 @@ class _ConnectScreenState extends State<ConnectScreen> {
               const SizedBox(width: S.md),
               Text(title, style: T.label),
             ]),
+          ),
+        ),
+      );
+}
+
+class _AddStudioPage extends StatefulWidget {
+  final String prefillHost;
+  const _AddStudioPage({required this.prefillHost});
+
+  @override
+  State<_AddStudioPage> createState() => _AddStudioPageState();
+}
+
+class _AddStudioPageState extends State<_AddStudioPage> {
+  late final _host = TextEditingController(text: widget.prefillHost);
+  final _name = TextEditingController();
+  String? _error;
+
+  @override
+  void dispose() { _host.dispose(); _name.dispose(); super.dispose(); }
+
+  void _save() {
+    if (parsePairing(_host.text) == null) {
+      setState(() => _error = 'Enter an IP like 192.168.1.42');
+      return;
+    }
+    Navigator.pop(context, (_name.text.trim(), _host.text.trim()));
+  }
+
+  @override
+  Widget build(BuildContext context) => Scaffold(
+        backgroundColor: C.bg,
+        appBar: AppBar(
+          backgroundColor: C.bg,
+          toolbarHeight: 52,
+          title: const Text('Add a studio', style: T.title),
+          actions: [
+            Padding(
+              padding: const EdgeInsets.only(right: S.md),
+              child: FilledButton(onPressed: _save, child: const Text('Save studio')),
+            ),
+          ],
+        ),
+        body: SafeArea(
+          child: ListView(
+            padding: const EdgeInsets.fromLTRB(S.xl, S.sm, S.xl, S.xl),
+            children: [
+              Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                Expanded(
+                  flex: 3,
+                  child: TextField(
+                    controller: _host,
+                    autofocus: widget.prefillHost.isEmpty,
+                    style: const TextStyle(color: C.text),
+                    keyboardType: TextInputType.url,
+                    autocorrect: false,
+                    textInputAction: TextInputAction.done,
+                    onSubmitted: (_) => _save(),
+                    decoration: InputDecoration(
+                      labelText: 'Desktop IP address',
+                      hintText: '192.168.1.42',
+                      errorText: _error,
+                      prefixIcon: Padding(padding: const EdgeInsets.all(12), child: PhosphorIcon(PhosphorIconsRegular.desktop, size: 18, color: C.textDim)),
+                    ),
+                  ),
+                ),
+                const SizedBox(width: S.md),
+                Expanded(
+                  flex: 2,
+                  child: TextField(
+                    controller: _name,
+                    style: const TextStyle(color: C.text),
+                    textInputAction: TextInputAction.done,
+                    onSubmitted: (_) => _save(),
+                    decoration: InputDecoration(
+                      labelText: 'Name (optional)',
+                      hintText: 'Main hall',
+                      prefixIcon: Padding(padding: const EdgeInsets.all(12), child: PhosphorIcon(PhosphorIconsRegular.tag, size: 18, color: C.textDim)),
+                    ),
+                  ),
+                ),
+              ]),
+            ],
           ),
         ),
       );

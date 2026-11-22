@@ -212,7 +212,7 @@ class _SettingsPanelState extends State<SettingsPanel> {
       Row(children: [
         PhosphorIcon(PhosphorIconsFill.aperture, size: 16, color: C.textFaint),
         const SizedBox(width: 6),
-        const Text('Church Cam  ·  v1.1.0', style: T.caption),
+        const Text('Church Cam  ·  v1.1.1', style: T.caption),
       ]),
       const SizedBox(height: S.sm),
       const BuiltByCredit(),
