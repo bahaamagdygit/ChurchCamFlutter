@@ -1,6 +1,11 @@
 package com.churchcam.flutter
 
 import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
+import android.os.BatteryManager
+import android.os.Build
+import android.os.PowerManager
 import android.net.wifi.WifiManager
 import androidx.annotation.NonNull
 import io.flutter.embedding.android.FlutterActivity
@@ -135,6 +140,25 @@ class MainActivity : FlutterActivity() {
                     } catch (e: Exception) {
                         result.success(mapOf("rssi" to -127, "bars" to 0))
                     }
+                }
+                "thermal" -> {
+                    // Battery temperature (tenths of °C from the sticky battery
+                    // broadcast) + the OS thermal status (API 29+: 0 none … 6
+                    // shutdown). Both are cheap; polled every 5 s.
+                    var tempC = -1.0
+                    try {
+                        val i = applicationContext.registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
+                        val t = i?.getIntExtra(BatteryManager.EXTRA_TEMPERATURE, Int.MIN_VALUE) ?: Int.MIN_VALUE
+                        if (t != Int.MIN_VALUE) tempC = t / 10.0
+                    } catch (_: Exception) {}
+                    var status = -1
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                        try {
+                            val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
+                            status = pm.currentThermalStatus
+                        } catch (_: Exception) {}
+                    }
+                    result.success(mapOf("tempC" to tempC, "status" to status))
                 }
                 else -> result.notImplemented()
             }
