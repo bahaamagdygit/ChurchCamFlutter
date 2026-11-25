@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:image_picker/image_picker.dart';
 import 'package:phosphor_flutter/phosphor_flutter.dart';
 import 'package:provider/provider.dart';
 import '../services/connection_service.dart';
@@ -25,6 +26,91 @@ class _SettingsPanelState extends State<SettingsPanel> {
   final _tcpCtrl = TextEditingController();
   String _resolution = '1080p';
   int _fps = 30;
+
+  bool _sendingFallback = false;
+
+  /// Pick a picture and make it the studio's camera-fallback picture. The
+  /// picker shrinks it to 1080p JPEG so it travels fast over Wi-Fi.
+  Future<void> _pickFallback(ConnectionService conn) async {
+    try {
+      final file = await ImagePicker().pickImage(source: ImageSource.gallery, maxWidth: 1920, maxHeight: 1080, imageQuality: 85);
+      if (file == null) return;
+      setState(() => _sendingFallback = true);
+      final bytes = await file.readAsBytes();
+      final mime = file.name.toLowerCase().endsWith('.png') ? 'image/png' : 'image/jpeg';
+      conn.sendFallbackImage(bytes, mime: mime);
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Fallback picture sent to the studio')));
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Could not use that picture: $e')));
+    } finally {
+      if (mounted) setState(() => _sendingFallback = false);
+    }
+  }
+
+  Widget _fallbackSection(ConnectionService conn) {
+    final connected = conn.status == ConnectionStatus.connected;
+    final thumb = conn.fallbackThumb;
+    return PanelSection(
+      title: 'Fallback picture',
+      children: [
+        const Text('Shown on the projector when a camera drops — or right now, with the switch below.', style: T.caption),
+        const SizedBox(height: S.md),
+        ClipRRect(
+          borderRadius: BorderRadius.circular(R.md),
+          child: AspectRatio(
+            aspectRatio: 16 / 9,
+            child: Container(
+              decoration: BoxDecoration(color: C.surface2, border: Border.all(color: conn.fallbackOn ? C.tally : C.border, width: conn.fallbackOn ? 2 : 1), borderRadius: BorderRadius.circular(R.md)),
+              child: thumb != null
+                  ? Image.memory(thumb, fit: BoxFit.cover, gaplessPlayback: true)
+                  : Center(child: Column(mainAxisSize: MainAxisSize.min, children: [
+                      PhosphorIcon(PhosphorIconsRegular.imageSquare, size: 30, color: C.textFaint),
+                      const SizedBox(height: 6),
+                      const Text('No picture set', style: T.caption),
+                    ])),
+            ),
+          ),
+        ),
+        const SizedBox(height: S.md),
+        Row(children: [
+          Expanded(child: SizedBox(height: 46, child: FilledButton.icon(
+            style: FilledButton.styleFrom(backgroundColor: C.accent, foregroundColor: C.accentInk, shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(R.md))),
+            onPressed: connected && !_sendingFallback ? () => _pickFallback(conn) : null,
+            icon: _sendingFallback
+                ? const SizedBox(width: 16, height: 16, child: CircularProgressIndicator(strokeWidth: 2, color: C.accentInk))
+                : PhosphorIcon(PhosphorIconsBold.image, size: 18, color: C.accentInk),
+            label: Text(thumb != null ? 'Change picture' : 'Choose picture', style: const TextStyle(fontWeight: FontWeight.w700)),
+          ))),
+          if (thumb != null) ...[
+            const SizedBox(width: S.sm),
+            SizedBox(height: 46, child: OutlinedButton(
+              style: OutlinedButton.styleFrom(foregroundColor: C.textDim, side: const BorderSide(color: C.border), shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(R.md))),
+              onPressed: connected ? () => conn.sendFallbackImage(null) : null,
+              child: const Text('Remove'),
+            )),
+          ],
+        ]),
+        const SizedBox(height: S.sm),
+        PanelTile(
+          icon: PhosphorIconsRegular.monitorPlay,
+          title: 'Show it now',
+          subtitle: conn.fallbackOn ? 'On the projector instead of the camera' : 'Camera is on the projector',
+          highlighted: conn.fallbackOn,
+          highlightColor: C.tally,
+          trailing: Switch(
+            value: conn.fallbackOn,
+            onChanged: connected ? (v) => conn.sendControl('cut_to_black', v) : null,
+          ),
+        ),
+        if (!connected) ...[
+          const SizedBox(height: S.xs),
+          const Text('Connect to the studio to change it.', style: T.caption),
+        ],
+      ],
+    );
+  }
 
   static const _resolutions = ['360p', '480p', '720p', '1080p', '2K', '4K'];
   static const _fpsOptions = [30, 60];
@@ -110,6 +196,7 @@ class _SettingsPanelState extends State<SettingsPanel> {
           const Text('Takes effect next time you connect.', style: T.caption),
         ],
       ),
+      _fallbackSection(conn),
       PanelSection(
         title: 'Video quality',
         children: [
@@ -212,7 +299,7 @@ class _SettingsPanelState extends State<SettingsPanel> {
       Row(children: [
         PhosphorIcon(PhosphorIconsFill.aperture, size: 16, color: C.textFaint),
         const SizedBox(width: 6),
-        const Text('Church Cam  ·  v1.1.1', style: T.caption),
+        const Text('Church Cam  ·  v1.1.3', style: T.caption),
       ]),
       const SizedBox(height: S.sm),
       const BuiltByCredit(),

@@ -116,6 +116,10 @@ class ConnectionService extends ChangeNotifier {
   String _activeCameraLabel = '';
   String _activeCameraId = '';
   String _previewCameraId = '';
+  // Studio fallback picture: on screen right now? + a small preview of it.
+  bool _fallbackOn = false;
+  Uint8List? _fallbackThumb;
+  String _fallbackThumbSrc = '';
   String _switchTransition = '';
   List<TransitionOption> _transitions = const [];
   bool _streamLive = false;
@@ -145,6 +149,8 @@ class ConnectionService extends ChangeNotifier {
   /// The director has cued THIS phone as the next camera (green tally).
   bool get isSelfCued => _deviceId.isNotEmpty && _previewCameraId == selfCameraId && !isSelfLive;
   String get previewCameraId => _previewCameraId;
+  bool get fallbackOn => _fallbackOn;
+  Uint8List? get fallbackThumb => _fallbackThumb;
   /// Quick reply from the camera operator to the director ("Ready", "OK"…).
   void sendDirectorReply(String text) => sendControl('director_reply', text);
   String get switchTransition => _switchTransition;
@@ -424,6 +430,15 @@ class ConnectionService extends ChangeNotifier {
           if (v['activeCameraLabel'] != null) _activeCameraLabel = v['activeCameraLabel'].toString();
           if (v['activeCameraId'] != null) _activeCameraId = v['activeCameraId'].toString();
           if (v.containsKey('previewCameraId')) _previewCameraId = (v['previewCameraId'] ?? '').toString();
+          if (v['fallbackOn'] is bool) _fallbackOn = v['fallbackOn'] as bool;
+          if (v.containsKey('fallbackThumb')) {
+            final src = (v['fallbackThumb'] ?? '').toString();
+            if (src != _fallbackThumbSrc) {
+              _fallbackThumbSrc = src;
+              final comma = src.indexOf(',');
+              try { _fallbackThumb = comma > 0 ? base64Decode(src.substring(comma + 1)) : null; } catch (_) { _fallbackThumb = null; }
+            }
+          }
           if (v['switchTransition'] != null) _switchTransition = v['switchTransition'].toString();
           if (v['transitions'] is List) {
             _transitions = (v['transitions'] as List)
@@ -737,6 +752,11 @@ class ConnectionService extends ChangeNotifier {
   /// Phone → desktop device status (battery, wifi signal) for the device list.
   void sendDeviceStatus(Map<String, dynamic> status) {
     _send({'type': 'device_status', 'value': status});
+  }
+
+  /// Set the studio's camera-fallback picture (JPEG/PNG bytes), or clear it (null).
+  void sendFallbackImage(Uint8List? bytes, {String mime = 'image/jpeg'}) {
+    _send({'type': 'set_fallback_image', 'value': bytes == null ? null : {'mime': mime, 'data': base64Encode(bytes)}});
   }
 
   /// Phone → desktop remote control (e.g. switch desktop camera, next slide).
